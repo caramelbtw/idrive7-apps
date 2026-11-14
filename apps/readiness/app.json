@@ -2,7 +2,7 @@
   "id": "readiness",
   "title": "Readiness",
   "description": "Read-only emissions readiness monitors and emission faults, with a progress bar and the driving that completes the rest",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "vendor": "custom",
   "loggingId": "OAA6",
   "iconGlyph": "engine",

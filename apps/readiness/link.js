@@ -18,7 +18,9 @@
  *   22 F4 <PID>  the same OBD-II data as 01 <PID>, as a UDS identifier (ISO 27145): what most BMW engine units
  *                answer over the head unit's link (01 is often refused with NRC 11). Same PIDs as 01 only.
  *
- * Only to the units in UNITS (engine unit, second engine unit, gearbox), physically, never to all at once.
+ * Physically only to the units in UNITS (engine unit, second engine unit, gearbox). To all units at once (functional,
+ * 0xDF: how an OBD-II scan tool asks) only 01 <PID> and 22 F4 <PID> with the PIDs above, for engine units that don't
+ * answer them physically over this link (askAll()).
  * No session change, no tester present, no clear (04 / 14), no other 22 identifier, no 2E / 2F / 31 / anything
  * else: check() throws.
  *
@@ -30,6 +32,7 @@ const { Diag } = require('./kit/diag');
 const PIDS = Object.freeze([0x00, 0x01, 0x20, 0x30, 0x31, 0x40, 0x41, 0x4E]);
 const DTC_SIDS = Object.freeze([0x03, 0x07, 0x0A]);
 const UNITS = Object.freeze({ 0x12: 'Engine unit', 0x13: 'Engine unit 2', 0x18: 'Gearbox' });
+const ALL = 0xDF;
 const LINKS = new WeakMap();
 
 const byte = (b) => Number.isInteger(b) && b >= 0 && b <= 0xFF;
@@ -38,6 +41,12 @@ const hx = (n) => (Number.isInteger(n) ? n.toString(16).toUpperCase().padStart(2
 /** Throws unless the request is one of the reads above. Exported for the tests. */
 function check(target, sid, data) {
     if (!Array.isArray(data) || !data.every(byte)) throw new Error('read-only: bad request bytes');
+    if (target === ALL) {
+        const ok = (sid === 0x01 && data.length === 1 && PIDS.indexOf(data[0]) >= 0)
+            || (sid === 0x22 && data.length === 2 && data[0] === 0xF4 && PIDS.indexOf(data[1]) >= 0);
+        if (!ok) throw new Error('read-only: only 01 <PID> and 22 F4 <PID> may go to all units');
+        return;
+    }
     if (!byte(target) || !UNITS[target]) throw new Error('read-only: unit ' + hx(target) + ' is not allowed');
     if (sid === 0x01) {
         if (data.length !== 1 || PIDS.indexOf(data[0]) < 0) throw new Error('read-only: 01 ' + data.map(hx).join(' ') + ' is not allowed');
@@ -77,6 +86,9 @@ class ReadinessLink {
         LINKS.set(this, diag);
         this.log = log;
         this.gapMs = (opts && opts.gapMs) || 40;
+        // the engine unit can take longer than 2 s over this link while other apps and BMW's services use it too
+        this.timeoutMs = Object.assign({ 0x12: 3000 }, opts && opts.timeoutMs);
+        this.allMs = (opts && opts.allMs) || 2500;
         this.silentAfter = (opts && opts.silentAfter) || 4;
         this.misses = {};
         this.stats = { sent: 0, replies: 0, missed: 0, blocked: 0 };
@@ -95,7 +107,7 @@ class ReadinessLink {
     /** One allowed request: the unit's reply bytes (41 .. / 43 .. / 7F ..), or null (no answer / skipped). */
     ask(target, sid, data) {
         const d = Array.isArray(data) ? data.slice() : [];       // checked = sent
-        try { check(target, sid, d); } catch (e) {
+        try { check(target, sid, d); if (target === ALL) throw new Error('read-only: 0xDF only through askAll()'); } catch (e) {
             this.stats.blocked++;
             this.log.error('blocked a diagnostic request: ' + e.message);
             return Promise.reject(e);
@@ -106,7 +118,7 @@ class ReadinessLink {
             if (wait) await sleep(wait);
             try {
                 this.stats.sent++;
-                const uds = await LINKS.get(this).physical(target, sid, d, 2000, accepts(sid, d));
+                const uds = await LINKS.get(this).physical(target, sid, d, this.timeoutMs[target] || 2000, accepts(sid, d));
                 if (!uds) { this.stats.missed++; this.misses[target] = (this.misses[target] || 0) + 1; return null; }
                 this.misses[target] = 0;
                 this.stats.replies++;
@@ -114,10 +126,51 @@ class ReadinessLink {
                 return uds;
             } finally { this.next = Math.max(this.next, Date.now() + this.gapMs); }
         };
+        return this.queue(run);
+    }
+
+    /**
+     * One allowed request to every unit at once (01 <PID> / 22 F4 <PID> only): Map(address -> reply bytes) of the
+     * units that answered it (positive or refused), empty when none did. Done as soon as unit 'want' has answered,
+     * else after allMs. Doesn't count towards silent().
+     */
+    askAll(sid, data, want) {
+        const d = Array.isArray(data) ? data.slice() : [];
+        try { if (!Array.isArray(data)) throw new Error('read-only: bad request bytes'); check(ALL, sid, d); } catch (e) {
+            this.stats.blocked++;
+            this.log.error('blocked a diagnostic request: ' + e.message);
+            return Promise.reject(e);
+        }
+        const run = async () => {
+            const wait = Math.max(0, this.next - Date.now());
+            if (wait) await sleep(wait);
+            const diag = LINKS.get(this), ok = accepts(sid, d), out = new Map();
+            let finish, timer;
+            const done = new Promise((r) => { finish = r; });
+            // only this request's answers: other apps' replies arrive here too ('response pending' isn't one)
+            const onFrame = (f) => {
+                if (!ok(f.uds) || (f.uds[0] === 0x7F && f.uds[2] === 0x78)) return;
+                out.set(f.ecu, f.uds);
+                if (f.ecu === want) finish();
+            };
+            diag.on('frame', onFrame);
+            try {
+                this.stats.sent++;
+                diag._check(await diag.send(ALL, sid, d));
+                timer = setTimeout(finish, this.allMs);        // from when the transport took it
+                await done;
+                this.stats.replies += out.size;
+                return out;
+            } finally { clearTimeout(timer); diag.removeListener('frame', onFrame); this.next = Math.max(this.next, Date.now() + this.gapMs); }
+        };
+        return this.queue(run);
+    }
+
+    queue(run) {
         const p = this.chain.then(run, run);
         this.chain = p.catch(() => {});
         return p;
     }
 }
 
-module.exports = { ReadinessLink, check, PIDS, DTC_SIDS, UNITS };
+module.exports = { ReadinessLink, check, PIDS, DTC_SIDS, UNITS, ALL };

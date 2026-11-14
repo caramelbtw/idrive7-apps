@@ -18,8 +18,9 @@ Misfire, fuel system, components, catalyst, heated catalyst, evaporative system,
 oxygen sensor, oxygen sensor heater and EGR system (SAE J1979 PID 01).
 
 Most BMW engine units don't answer OBD-II service `01` over the head unit's diagnostic link. They give the same PIDs
-as UDS identifiers `22 F4 <PID>` (ISO 27145), as Car Vitals reads them. The app asks `22 F4xx` first and falls back
-to `01`, then keeps to whichever the unit answered.
+as UDS identifiers `22 F4 <PID>` (ISO 27145), as Car Vitals reads them. Some answer neither when asked on their
+own, only when every unit is asked at once, as an OBD-II scan tool does. The app asks the engine unit `22 F4xx`,
+then `01`, then `01` and `22 F4xx` to all units, and keeps to whichever answered.
 
 - **Heated catalyst, secondary air and A/C refrigerant** are optional. The car's first answer says whether it has
   them, and any it lacks are left out for the rest of the session.
@@ -60,7 +61,7 @@ can need more than one drive.
   - `19 02 <mask>` to read BMW's fault memory: only sub-function `02`, so no `19` sub-function that does anything else
   - `22 F1 50` to read the unit type, and `22 F4 <PID>` with the same PIDs as `01`: no other identifier
   - only to the engine unit (`0x12`), the second engine unit (`0x13`) and the gearbox (`0x18`)
-  - never to all units at once
+  - to all units at once only `01 <PID>` and `22 F4 <PID>` with the PIDs above
 
   OBD service `04` (clear faults), UDS `14`, sessions, writes, routines, I/O control and tester present are all
   refused. The test checks that each one is refused and that a refused request never reaches the transport.
@@ -68,7 +69,7 @@ can need more than one drive.
   read every 10 s, and faults and the since-cleared counters every 30 s. *Refresh* reads everything again. A unit
   that doesn't answer 4 times in a row is skipped until the next Refresh. With no answer at all (ignition off), it
   tries again every 30 s. The fault memory is read even when readiness gets no answer, and the Readiness page shows
-  what each engine unit replied (refused, and why, or no reply).
+  what each engine unit replied to each way it was asked (refused, and why, or no reply).
 - **Nothing on disk.**
 
 ## Settings

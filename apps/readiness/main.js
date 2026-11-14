@@ -28,7 +28,7 @@ const mgu = require('./kit/mgu');
 const G = require('./kit/gauges');
 const { withAlpha } = require('./kit/canvas');
 const { fitText } = require('./kit/text-layout');
-const { ReadinessLink, UNITS } = require('./link');
+const { ReadinessLink, UNITS, ALL } = require('./link');
 const M = require('./monitors');
 const DEMO = require('./demo');
 const BMW = require('./bmw');
@@ -57,7 +57,7 @@ mgu.run({
                 demo: !!demo,
                 phase: 'idle',             // idle | connecting | ok | noanswer | error
                 units: {},                 // engine address -> { pids: Set, via: 'uds' (22 F4xx) | 'obd' (01) }
-                why: {},                   // address -> the last refusal / no reply (shown when nothing answers)
+                why: {},                   // address -> { request: what it replied } (shown when nothing answers)
                 gearbox: true,             // asked for faults until it doesn't answer
                 since: null, cycle: null,  // merged readiness: since faults cleared (01) / this drive (41)
                 keep: null,                // the optional monitors this car has (fixed at the first answer)
@@ -75,23 +75,38 @@ mgu.run({
             if (S.demo) { await sleep(30); return DEMO.reply(addr, sid, data); }
             try { return await link.ask(addr, sid, data); } catch (e) { log.warn('ask ' + addr.toString(16) + ': ' + e.message); return null; }
         }
+        /** the same to every unit at once (as an OBD-II scan tool asks): Map(address -> reply) */
+        async function askAll(sid, data, want) {
+            if (S.demo) { await sleep(30); const m = new Map(), r = DEMO.reply(0x12, sid, data); if (r) m.set(0x12, r); return m; }
+            try { return await link.askAll(sid, data, want); } catch (e) { log.warn('ask all: ' + e.message); return new Map(); }
+        }
         const NRC = { 0x10: 'rejected', 0x11: 'service not supported', 0x12: 'not supported', 0x13: 'bad length', 0x21: 'busy',
             0x22: 'conditions not correct', 0x31: 'not available', 0x7E: 'not in this session', 0x7F: 'not in this session' };
         const note = (addr, what, u) => {
-            S.why[addr] = what + ': ' + (!u ? 'no reply' : u[0] === 0x7F ? 'refused (' + (NRC[u[2]] || 'NRC ' + u[2].toString(16).toUpperCase()) + ')' : 'unexpected reply');
+            (S.why[addr] || (S.why[addr] = {}))[what] = !u ? 'no reply' : u[0] === 0x7F ? 'refused (' + (NRC[u[2]] || 'NRC ' + u[2].toString(16).toUpperCase()) + ')' : 'unexpected reply';
         };
+        const why = (addr) => Object.keys(S.why[addr] || {}).map((k) => k + ': ' + S.why[addr][k]).join(' · ');
+        const h2 = (n) => n.toString(16).toUpperCase().padStart(2, '0');
 
         /**
          * One OBD-II PID from an engine unit: its data bytes (after the PID), or null. BMW engine units usually give
-         * OBD data as UDS identifiers (22 F4 <PID>) over this link and refuse 01; others answer 01. 'via' fixes the
-         * one that answered; until then both are tried.
+         * OBD data as UDS identifiers (22 F4 <PID>) over this link; others answer 01; some answer neither when asked
+         * on their own, only when every unit is asked at once as an OBD-II scan tool does ('all-obd' / 'all-uds', for
+         * the engine unit only). 'via' fixes the one that answered; until then each is tried in turn.
          */
+        const VIAS = { 0x12: ['uds', 'obd', 'all-obd', 'all-uds'] };
         async function pid(addr, p, via) {
-            for (const v of via ? [via] : ['uds', 'obd']) {
-                const u = v === 'uds' ? await ask(addr, 0x22, [0xF4, p]) : await ask(addr, 0x01, [p]);
-                if (v === 'uds' && u && u[0] === 0x62 && u[1] === 0xF4 && u[2] === p) return { via: v, data: u.slice(3) };
-                if (v === 'obd' && u && u[0] === 0x41 && u[1] === p) return { via: v, data: u.slice(2) };
-                note(addr, v === 'uds' ? '22 F4' + p.toString(16).toUpperCase().padStart(2, '0') : '01 ' + p.toString(16).toUpperCase().padStart(2, '0'), u);
+            for (const v of via ? [via] : VIAS[addr] || ['uds', 'obd']) {
+                const uds = v === 'uds' || v === 'all-uds', sid = uds ? 0x22 : 0x01, req = uds ? [0xF4, p] : [p];
+                let u;
+                if (v.startsWith('all-')) {
+                    const m = await askAll(sid, req, addr);
+                    // the engine unit's answer; else the first positive one from a unit other than the gearbox
+                    u = m.get(addr) || [...m].filter(([a, r]) => a !== 0x18 && r[0] !== 0x7F).map(([, r]) => r)[0] || null;
+                } else u = await ask(addr, sid, req);
+                if (uds && u && u[0] === 0x62 && u[1] === 0xF4 && u[2] === p) return { via: v, data: u.slice(3) };
+                if (!uds && u && u[0] === 0x41 && u[1] === p) return { via: v, data: u.slice(2) };
+                note(addr, (v.startsWith('all-') ? 'all ' : '') + (uds ? '22 F4' + h2(p) : '01 ' + h2(p)), u);
                 if (!u && addr !== 0x12) break;            // silence from a second engine unit: there is none (no 2 s more)
             }
             return null;
@@ -100,24 +115,25 @@ mgu.run({
         /** which engine units give readiness, how (22 F4xx or 01), and the PIDs each one supports (00 -> 20 -> 40) */
         async function discover() {
             S.units = {};
+            S.why = {};
             for (const addr of ENGINES) {
-                const pids = new Set();
-                let via = null;
+                // readiness itself first (some units don't list their PIDs), then the PIDs it has, asked the same way
+                const r = await pid(addr, 0x01, null);
+                if (!r || r.data.length < 4) continue;
+                const pids = new Set([0x01]);
                 for (let base = 0x00; base <= 0x40; base += 0x20) {
                     if (base && !pids.has(base)) break;
-                    const r = await pid(addr, base, via);
-                    if (!r || r.data.length < 4) break;
-                    via = r.via;
-                    for (let i = 0; i < 32; i++) if (r.data[i >> 3] & (0x80 >> (i & 7))) pids.add(base + i + 1);
+                    const m = await pid(addr, base, r.via);
+                    if (!m || m.data.length < 4) break;
+                    for (let i = 0; i < 32; i++) if (m.data[i >> 3] & (0x80 >> (i & 7))) pids.add(base + i + 1);
                 }
-                if (via && pids.has(0x01)) { S.units[addr] = { pids, via }; continue; }
-                if (addr === 0x12) {
-                    // some units don't list their PIDs: ask readiness itself before giving up on the engine unit
-                    const r = await pid(addr, 0x01, via);
-                    if (r && r.data.length >= 4) S.units[addr] = { pids: new Set([0x01]), via: r.via };
-                }
+                S.units[addr] = { pids, via: r.via };
             }
-            Object.keys(S.units).forEach((a) => log.info('unit ' + Number(a).toString(16) + ': readiness by ' + (S.units[a].via === 'uds' ? '22 F4xx' : '01')));
+            // trying every way isn't the unit being asleep: its fault memory is still asked for right after
+            link.wake();
+            const by = { uds: '22 F4xx', obd: '01', 'all-obd': '01 to all units', 'all-uds': '22 F4xx to all units' };
+            Object.keys(S.units).forEach((a) => log.info('unit ' + Number(a).toString(16) + ': readiness by ' + by[S.units[a].via]));
+            if (!S.units[0x12]) log.info('engine unit: no readiness (' + why(0x12) + ')');
             return Object.keys(S.units).length > 0;
         }
 
@@ -345,7 +361,16 @@ mgu.run({
                 const lines = wrap(cv, msg, 24, 900);
                 lines.forEach((l, i) => cv.text(l, 48, 290 + i * 34, 24, t.dim));
                 // what each unit said, so a refusal can be told from silence
-                if (S.phase === 'noanswer') ENGINES.forEach((a, i) => { if (S.why[a]) cv.text(fitText(cv, UNITS[a] + ' · ' + S.why[a], 20, 900), 48, 300 + lines.length * 34 + 12 + i * 28, 20, t.dim); });
+                if (S.phase === 'noanswer') {
+                    let y = 300 + lines.length * 34 + 8;
+                    ENGINES.forEach((a) => {
+                        if (!S.why[a]) return;
+                        wrap(cv, UNITS[a] + ' · ' + why(a), 18, 940).slice(0, 2).forEach((l) => {
+                            if (y < p.y + p.h - 10) cv.text(fitText(cv, l, 18, 940), 48, y, 18, t.dim);
+                            y += 24;
+                        });
+                    });
+                }
                 return;
             }
             const per = Math.ceil(v.rows.length / 2), rh = Math.min(44, Math.floor((p.h - 70) / per));

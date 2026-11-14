@@ -54,7 +54,8 @@ test('guard allows only the listed reads', () => {
         [0x12, 0x01, [0x0C]],             // a PID not on the list
         [0x12, 0x01, [0x01, 0x41]],       // two PIDs
         [0x12, 0x03, [0x00]],             // 03 with data
-        [0xDF, 0x01, [0x01]],             // everyone
+        [0xDF, 0x19, [0x02, 0x0C]],       // everyone: only readiness PIDs may go to all units
+        [0xDF, 0x01, [0x0C]],
         [0x40, 0x03, []],                 // a unit not on the list
         [0x12, 0x01, [256]],
     ];
@@ -74,7 +75,9 @@ function fakeSignals(sent, answer) {
             sent.push([req.targetAddress, req.serviceID, data]);
             setTimeout(() => {
                 const r = (answer || DEMO.reply)(req.targetAddress, req.serviceID, data);
-                if (r) bus.emit('sendTasuResponse', { udsResponse: Buffer.from([0, 0, 0, 0, 0, 0, req.targetAddress, 0, 0].concat(r)), errorCode: 'NO_ERROR' });
+                // { from: address, uds: [...] }: a reply from that unit (how units answer a request to all, 0xDF)
+                const from = r && r.from !== undefined ? r.from : req.targetAddress, uds = r && r.uds ? r.uds : r;
+                if (uds) bus.emit('sendTasuResponse', { udsResponse: Buffer.from([0, 0, 0, 0, 0, 0, from, 0, 0].concat(uds)), errorCode: 'NO_ERROR' });
             }, 2);
             return 'NO_ERROR';
         },
@@ -254,13 +257,42 @@ test('an engine unit that answers only service 01 still gives readiness', async 
 test('no readiness answer: faults are still read, and the refusal is shown', async () => {
     const none = (a, s, d) => (s === 0x01 || (s === 0x22 && d[0] === 0xF4) ? (a === 0x12 ? [0x7F, s, 0x11] : null) : DEMO.reply(a, s, d));
     const sent = [], app = await runApp('off', sent, none);
-    await new Promise((r) => setTimeout(r, 6000));
+    await new Promise((r) => setTimeout(r, 10000));        // every way is tried (to all units too) before giving up
     sent.forEach(([a, s, d]) => check(a, s, d));
     assert.ok(sent.some(([a, s, d]) => a === 0x12 && s === 0x19 && d[0] === 0x02), 'read BMW fault memory without readiness');
-    await app.shot('x');
+    await app.shot('no-answer');
     assert.ok(/service not supported/.test(app.texts()), 'refusal shown');
+    assert.ok(/22 F401: refused/.test(app.texts()) && /01 01: refused/.test(app.texts()) && /all 01 01: no reply/.test(app.texts()), 'every reason shown: ' + app.texts());
     app.tab(1); await app.shot('x');
     assert.ok(/190302/.test(app.texts()), 'BMW fault shown');
+});
+
+test('an engine unit silent to readiness asked on its own still gives it when every unit is asked', async () => {
+    // as on a car where the fault memory answers but 22 F4xx / 01 to 0x12 get no reply: only 01 to all units does
+    const onlyAll = (a, s, d) => {
+        if (a === 0xDF && s === 0x01) { const r = DEMO.reply(0x12, 0x22, [0xF4, d[0]]); return r[0] === 0x62 ? { from: 0x12, uds: [0x41].concat(r.slice(2)) } : null; }
+        if (a === 0xDF) return null;
+        if (s === 0x01 || (s === 0x22 && d[0] === 0xF4)) return null;
+        return DEMO.reply(a, s, d);
+    };
+    const sent = [], app = await runApp('off', sent, onlyAll);
+    await new Promise((r) => setTimeout(r, 16000));
+    sent.forEach(([a, s, d]) => check(a, s, d));
+    assert.ok(sent.some(([a, s, d]) => a === 0xDF && s === 0x01 && d[0] === 0x01), 'asked 01 01 of all units');
+    assert.ok(sent.every(([a, s]) => a !== 0xDF || s === 0x01 || s === 0x22), 'only reads to all units');
+    assert.ok(sent.some(([a, s, d]) => a === 0x12 && s === 0x19 && d[0] === 0x02), 'fault memory still read after the silent tries');
+    await app.shot('x');
+    assert.ok(/monitors complete/.test(app.texts()), 'readiness shown: ' + app.texts());
+});
+
+test('the guard lets only readiness reads go to all units', async () => {
+    check(0xDF, 0x01, [0x01]); check(0xDF, 0x22, [0xF4, 0x41]);
+    [[0xDF, 0x19, [0x02, 0x0C]], [0xDF, 0x03, []], [0xDF, 0x22, [0xF1, 0x50]], [0xDF, 0x01, [0x0C]], [0xDF, 0x04, []], [0xDF, 0x14, [0xFF, 0xFF, 0xFF]]]
+        .forEach(([a, s, d]) => assert.throws(() => check(a, s, d), /read-only/));
+    const sent = [], link = await new ReadinessLink(fakeSignals(sent), quietLog, { gapMs: 1 }).init();
+    await assert.rejects(() => link.ask(0xDF, 0x01, [0x01]), /read-only/);          // to all units only by askAll()
+    await assert.rejects(() => link.askAll(0x14, [0xFF, 0xFF, 0xFF]), /read-only/);
+    assert.strictEqual(sent.length, 0);
 });
 
 (async () => {
