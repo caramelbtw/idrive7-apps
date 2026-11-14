@@ -15,7 +15,11 @@ It only reads. Nothing is written, coded, cleared, reset or actuated.
 ## Monitors
 
 Misfire, fuel system, components, catalyst, heated catalyst, evaporative system, secondary air system, A/C refrigerant,
-oxygen sensor, oxygen sensor heater and EGR system (SAE J1979 service 01 PID 01).
+oxygen sensor, oxygen sensor heater and EGR system (SAE J1979 PID 01).
+
+Most BMW engine units don't answer OBD-II service `01` over the head unit's diagnostic link. They give the same PIDs
+as UDS identifiers `22 F4 <PID>` (ISO 27145), as Car Vitals reads them. The app asks `22 F4xx` first and falls back
+to `01`, then keeps to whichever the unit answered.
 
 - **Heated catalyst, secondary air and A/C refrigerant** are optional. The car's first answer says whether it has
   them, and any it lacks are left out for the rest of the session.
@@ -53,7 +57,7 @@ can need more than one drive.
   - `01` with one PID from `00 01 20 30 31 40 41 4E`
   - `03`, `07` and `0A` with no data
   - `19 02 <mask>` to read BMW's fault memory: only sub-function `02`, so no `19` sub-function that does anything else
-  - `22 F1 50` to read the unit type: no other identifier
+  - `22 F1 50` to read the unit type, and `22 F4 <PID>` with the same PIDs as `01`: no other identifier
   - only to the engine unit (`0x12`), the second engine unit (`0x13`) and the gearbox (`0x18`)
   - never to all units at once
 
@@ -62,7 +66,8 @@ can need more than one drive.
 - **Gently.** One request at a time, at least 40 ms apart, and only while the app's screen is shown. Readiness is
   read every 10 s, and faults and the since-cleared counters every 30 s. *Refresh* reads everything again. A unit
   that doesn't answer 4 times in a row is skipped until the next Refresh. With no answer at all (ignition off), it
-  tries again every 30 s.
+  tries again every 30 s. The fault memory is read even when readiness gets no answer, and the Readiness page shows
+  what each engine unit replied (refused, and why, or no reply).
 - **Nothing on disk.**
 
 ## Settings

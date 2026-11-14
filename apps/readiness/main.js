@@ -19,7 +19,8 @@
  * not counted.
  *
  * READ ONLY by construction: every request goes through link.js, which refuses anything but OBD-II 01 (a fixed list
- * of PIDs), 03, 07 and 0A, UDS 19 02 (read fault memory) and 22 F1 50 (unit type), to the engine unit(s) and gearbox. No clear, no session change, no write, no routine, no
+ * of PIDs), 03, 07 and 0A, UDS 19 02 (read fault memory), 22 F1 50 (unit type) and 22 F4 <PID> (the PIDs of 01 as UDS
+ * identifiers: how BMW engine units answer them), to the engine unit(s) and gearbox. No clear, no session change, no write, no routine, no
  * actuation, and no car signal is set. It asks only while its screen is shown: readiness every 10 s, the rest every
  * 30 s, and everything again on Refresh. Nothing is stored on disk.
  */
@@ -55,7 +56,8 @@ mgu.run({
             return {
                 demo: !!demo,
                 phase: 'idle',             // idle | connecting | ok | noanswer | error
-                units: {},                 // engine address -> { pids: Set } (the ones that answered 01 00)
+                units: {},                 // engine address -> { pids: Set, via: 'uds' (22 F4xx) | 'obd' (01) }
+                why: {},                   // address -> the last refusal / no reply (shown when nothing answers)
                 gearbox: true,             // asked for faults until it doesn't answer
                 since: null, cycle: null,  // merged readiness: since faults cleared (01) / this drive (41)
                 keep: null,                // the optional monitors this car has (fixed at the first answer)
@@ -73,37 +75,61 @@ mgu.run({
             if (S.demo) { await sleep(30); return DEMO.reply(addr, sid, data); }
             try { return await link.ask(addr, sid, data); } catch (e) { log.warn('ask ' + addr.toString(16) + ': ' + e.message); return null; }
         }
-        const ok01 = (u, pid) => u && u[0] === 0x41 && u[1] === pid;
+        const NRC = { 0x10: 'rejected', 0x11: 'service not supported', 0x12: 'not supported', 0x13: 'bad length', 0x21: 'busy',
+            0x22: 'conditions not correct', 0x31: 'not available', 0x7E: 'not in this session', 0x7F: 'not in this session' };
+        const note = (addr, what, u) => {
+            S.why[addr] = what + ': ' + (!u ? 'no reply' : u[0] === 0x7F ? 'refused (' + (NRC[u[2]] || 'NRC ' + u[2].toString(16).toUpperCase()) + ')' : 'unexpected reply');
+        };
 
-        /** which engine units answer OBD, and the PIDs each one supports (00 -> 20 -> 40) */
+        /**
+         * One OBD-II PID from an engine unit: its data bytes (after the PID), or null. BMW engine units usually give
+         * OBD data as UDS identifiers (22 F4 <PID>) over this link and refuse 01; others answer 01. 'via' fixes the
+         * one that answered; until then both are tried.
+         */
+        async function pid(addr, p, via) {
+            for (const v of via ? [via] : ['uds', 'obd']) {
+                const u = v === 'uds' ? await ask(addr, 0x22, [0xF4, p]) : await ask(addr, 0x01, [p]);
+                if (v === 'uds' && u && u[0] === 0x62 && u[1] === 0xF4 && u[2] === p) return { via: v, data: u.slice(3) };
+                if (v === 'obd' && u && u[0] === 0x41 && u[1] === p) return { via: v, data: u.slice(2) };
+                note(addr, v === 'uds' ? '22 F4' + p.toString(16).toUpperCase().padStart(2, '0') : '01 ' + p.toString(16).toUpperCase().padStart(2, '0'), u);
+                if (!u && addr !== 0x12) break;            // silence from a second engine unit: there is none (no 2 s more)
+            }
+            return null;
+        }
+
+        /** which engine units give readiness, how (22 F4xx or 01), and the PIDs each one supports (00 -> 20 -> 40) */
         async function discover() {
             S.units = {};
             for (const addr of ENGINES) {
                 const pids = new Set();
+                let via = null;
                 for (let base = 0x00; base <= 0x40; base += 0x20) {
                     if (base && !pids.has(base)) break;
-                    const u = await ask(addr, 0x01, [base]);
-                    if (!ok01(u, base) || u.length < 6) break;
-                    for (let i = 0; i < 32; i++) if (u[2 + (i >> 3)] & (0x80 >> (i & 7))) pids.add(base + i + 1);
+                    const r = await pid(addr, base, via);
+                    if (!r || r.data.length < 4) break;
+                    via = r.via;
+                    for (let i = 0; i < 32; i++) if (r.data[i >> 3] & (0x80 >> (i & 7))) pids.add(base + i + 1);
                 }
-                if (pids.has(0x01)) S.units[addr] = { pids };
-                else if (addr === 0x12 && pids.size === 0) {
+                if (via && pids.has(0x01)) { S.units[addr] = { pids, via }; continue; }
+                if (addr === 0x12) {
                     // some units don't list their PIDs: ask readiness itself before giving up on the engine unit
-                    const u = await ask(addr, 0x01, [0x01]);
-                    if (ok01(u, 0x01)) S.units[addr] = { pids: new Set([0x01]) };
+                    const r = await pid(addr, 0x01, via);
+                    if (r && r.data.length >= 4) S.units[addr] = { pids: new Set([0x01]), via: r.via };
                 }
             }
+            Object.keys(S.units).forEach((a) => log.info('unit ' + Number(a).toString(16) + ': readiness by ' + (S.units[a].via === 'uds' ? '22 F4xx' : '01')));
             return Object.keys(S.units).length > 0;
         }
 
         async function readReadiness() {
             const since = [], cycle = [];
             for (const a of Object.keys(S.units).map(Number)) {
-                const u = await ask(a, 0x01, [0x01]);
-                if (ok01(u, 0x01)) since.push(M.readiness(u.slice(2)));
-                if (S.units[a].pids.has(0x41)) {
-                    const c = await ask(a, 0x01, [0x41]);
-                    if (ok01(c, 0x41)) cycle.push(M.readiness(c.slice(2)));
+                const u = S.units[a];
+                const r = await pid(a, 0x01, u.via);
+                if (r && r.data.length >= 4) since.push(M.readiness(r.data));
+                if (u.pids.has(0x41)) {
+                    const c = await pid(a, 0x41, u.via);
+                    if (c && c.data.length >= 4) cycle.push(M.readiness(c.data));
                 }
             }
             if (!since.length) return false;
@@ -118,10 +144,10 @@ mgu.run({
             const u = S.units[0x12] || S.units[0x13];
             if (!u) return;
             const addr = S.units[0x12] ? 0x12 : 0x13, st = {};
-            const num = async (pid, n) => {
-                if (!u.pids.has(pid)) return null;
-                const r = await ask(addr, 0x01, [pid]);
-                return ok01(r, pid) && r.length >= 2 + n ? (n === 2 ? (r[2] << 8) | r[3] : r[2]) : null;
+            const num = async (p, n) => {
+                if (!u.pids.has(p)) return null;
+                const r = await pid(addr, p, u.via);
+                return r && r.data.length >= n ? (n === 2 ? (r.data[0] << 8) | r.data[1] : r.data[0]) : null;
             };
             st.warmups = await num(0x30, 1);
             st.dist = await num(0x31, 2);
@@ -147,7 +173,9 @@ mgu.run({
          * ('crit' | 'warn'), bmw }. Kept as it was when no unit answered at all.
          */
         async function readFaults() {
-            const out = [], units = Object.keys(S.units).map(Number).concat(S.gearbox ? [0x18] : []);
+            // the engine unit(s) that give readiness; the engine unit anyway when none does (its fault memory still answers)
+            const engines = Object.keys(S.units).map(Number);
+            const out = [], units = (engines.length ? engines : [0x12]).concat(S.gearbox ? [0x18] : []);
             let answered = false;
             await identify(units);
             for (const addr of units) {
@@ -155,6 +183,7 @@ mgu.run({
                 const r = await ask(addr, 0x19, [0x02, BMW_MASK]);
                 if (addr === 0x18 && r === null) { S.gearbox = false; continue; }
                 const list = BMW.parse(r);
+                if (!list) note(addr, '19 02', r);
                 if (list) {
                     answered = true;
                     list.forEach((d) => {
@@ -196,17 +225,21 @@ mgu.run({
                     if (S.phase === 'noanswer' && now - S.readAt < SLOW_MS && S.readAt) return;
                     if (S.phase === 'noanswer') link.wake();          // try again every 30 s (ignition may be on now)
                     S.phase = 'connecting'; changed();
-                    if (!S.demo && !link.available) { S.phase = 'error'; S.error = 'No diagnostic link on this head unit'; S.readAt = now; return; }
-                    if (!(await discover())) { S.phase = 'noanswer'; S.readAt = now; return; }
-                    S.phase = 'ok';
+                    if (!S.demo && !link.ready) {
+                        if (link.failed) { S.phase = 'error'; S.error = 'No diagnostic link on this head unit (' + link.failed + ')'; S.readAt = now; }
+                        else S.phase = 'idle';                          // still connecting: next second
+                        return;
+                    }
+                    if (await discover()) S.phase = 'ok';
+                    else { S.phase = 'noanswer'; S.readAt = now; }
                 }
-                if (now - S.readAt >= READ_MS) {
-                    if (!(await readReadiness())) { S.phase = 'noanswer'; S.readAt = now; return; }
+                if (S.phase === 'ok' && now - S.readAt >= READ_MS) {
+                    if (!(await readReadiness())) { S.phase = 'noanswer'; S.readAt = now; }
                     changed();
                 }
                 if (now - S.slowAt >= SLOW_MS) {
                     S.slowAt = now;
-                    await readStats(); changed();
+                    if (S.phase === 'ok') { await readStats(); changed(); }
                     await readFaults(); changed();
                 }
             } catch (e) {
@@ -308,8 +341,11 @@ mgu.run({
             const p = G.panel(cv, t, 24, 192, 1000, 320, 'Monitors');
             if (!v.rows.length) {
                 const msg = S.phase === 'error' ? 'This head unit has no diagnostic link. Demo data: Settings.'
-                    : S.phase === 'noanswer' ? 'No answer. Switch the ignition on (engine running is best), then Refresh.' : 'Reading...';
-                wrap(cv, msg, 24, 900).forEach((l, i) => cv.text(l, 48, 300 + i * 34, 24, t.dim));
+                    : S.phase === 'noanswer' ? 'The engine unit gave no readiness. Switch the ignition on (engine running is best), then Refresh.' : 'Reading...';
+                const lines = wrap(cv, msg, 24, 900);
+                lines.forEach((l, i) => cv.text(l, 48, 290 + i * 34, 24, t.dim));
+                // what each unit said, so a refusal can be told from silence
+                if (S.phase === 'noanswer') ENGINES.forEach((a, i) => { if (S.why[a]) cv.text(fitText(cv, UNITS[a] + ' · ' + S.why[a], 20, 900), 48, 300 + lines.length * 34 + 12 + i * 28, 20, t.dim); });
                 return;
             }
             const per = Math.ceil(v.rows.length / 2), rh = Math.min(44, Math.floor((p.h - 70) / per));

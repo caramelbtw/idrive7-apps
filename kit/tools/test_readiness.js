@@ -29,7 +29,8 @@ const test = (name, fn) => tests.push([name, fn]);
 test('guard allows only the listed reads', () => {
     [[0x12, 0x01, [0x01]], [0x12, 0x01, [0x41]], [0x13, 0x01, [0x00]], [0x12, 0x01, [0x4E]],
         [0x12, 0x03, []], [0x12, 0x07, []], [0x18, 0x0A, []],
-        [0x12, 0x19, [0x02, 0x0C]], [0x18, 0x19, [0x02, 0xFF]], [0x12, 0x22, [0xF1, 0x50]]].forEach(([a, s, d]) => check(a, s, d));
+        [0x12, 0x19, [0x02, 0x0C]], [0x18, 0x19, [0x02, 0xFF]], [0x12, 0x22, [0xF1, 0x50]],
+        [0x12, 0x22, [0xF4, 0x01]], [0x13, 0x22, [0xF4, 0x41]], [0x12, 0x22, [0xF4, 0x00]]].forEach(([a, s, d]) => check(a, s, d));
     const bad = [
         [0x12, 0x04, []],                 // OBD clear faults
         [0x12, 0x14, [0xFF, 0xFF, 0xFF]], // UDS clear DTCs
@@ -42,6 +43,9 @@ test('guard allows only the listed reads', () => {
         [0x12, 0x85, [0x02]],             // DTC setting
         [0x12, 0x22, [0xF1, 0x90]],       // only F1 50 of 22
         [0x12, 0x22, [0xF1, 0x50, 0xF1, 0x90]],
+        [0x12, 0x22, [0xF4, 0x0C]],       // F4 only with the PIDs of 01
+        [0x12, 0x22, [0xF4, 0x01, 0xF4]],
+        [0x12, 0x22, [0xF6, 0x01]],
         [0x12, 0x19, [0x02]],             // 19 02 needs its mask
         [0x12, 0x19, [0x04, 0x14, 0x03, 0x02, 0xFF]], // other 19 sub-functions: no
         [0x12, 0x19, [0x0A, 0x00]],
@@ -58,7 +62,7 @@ test('guard allows only the listed reads', () => {
 });
 
 /* ---------- a fake head unit: TASU answered by the demo car, every request recorded ---------- */
-function fakeSignals(sent) {
+function fakeSignals(sent, answer) {
     const bus = new EventEmitter();
     return {
         async proxy() { return { id: 'tasu' }; },
@@ -69,7 +73,7 @@ function fakeSignals(sent) {
             const data = Array.from(req.udsData);
             sent.push([req.targetAddress, req.serviceID, data]);
             setTimeout(() => {
-                const r = DEMO.reply(req.targetAddress, req.serviceID, data);
+                const r = (answer || DEMO.reply)(req.targetAddress, req.serviceID, data);
                 if (r) bus.emit('sendTasuResponse', { udsResponse: Buffer.from([0, 0, 0, 0, 0, 0, req.targetAddress, 0, 0].concat(r)), errorCode: 'NO_ERROR' });
             }, 2);
             return 'NO_ERROR';
@@ -83,8 +87,8 @@ test('a blocked request never reaches the transport', async () => {
     await assert.rejects(() => link.ask(0x12, 0x04, []), /read-only/);
     await assert.rejects(() => link.ask(0x12, 0x14, [0xFF, 0xFF, 0xFF]), /read-only/);
     assert.strictEqual(sent.length, 0);
-    const r = await link.ask(0x12, 0x01, [0x01]);
-    assert.deepStrictEqual(r.slice(0, 2), [0x41, 0x01]);
+    const r = await link.ask(0x12, 0x22, [0xF4, 0x01]);
+    assert.deepStrictEqual(r.slice(0, 3), [0x62, 0xF4, 0x01]);
     assert.strictEqual(sent.length, 1);
     assert.strictEqual(link.stats.blocked, 2);
 });
@@ -163,7 +167,7 @@ test('BMW fault memory: parse, text, monitor', () => {
 });
 
 /* ---------- the whole app on the fake head unit ---------- */
-async function runApp(demoSetting, sent) {
+async function runApp(demoSetting, sent, answer) {
     const { Recorder, play } = require(path.join(KIT, 'record'));
     const { Canvas } = require(path.join(KIT, 'canvas'));
     const themes = require(path.join(KIT, 'themes'));
@@ -175,10 +179,16 @@ async function runApp(demoSetting, sent) {
     require(path.join(APP, 'main'));
     const ctx = {
         log: quietLog, dataDir: fs.mkdtempSync(path.join(require('os').tmpdir(), 'rd-')),
-        signals: fakeSignals(sent),
+        signals: fakeSignals(sent, answer),
         settings: { get: (k) => vals[k], onChange() {} },
         theme: () => themes.theme(vals.theme),
-        canvas: (w, h) => new Recorder(w, h),
+        canvas: (w, h) => {
+            // the strings drawn, for the checks (glyphs are all a Recorder keeps)
+            const r = new Recorder(w, h), text = r.text.bind(r);
+            r.said = [];
+            r.text = (str, ...a) => { r.said.push(String(str)); return text(str, ...a); };
+            return r;
+        },
         ui: {
             onClick(id, fn) { clicks[id] = fn; }, text() {}, isVisible: () => true, onVisible() {}, onFocus() {},
             async image(id, cv) { frames.push(cv); },
@@ -188,6 +198,7 @@ async function runApp(demoSetting, sent) {
     };
     await mguApp.start(ctx);
     const shot = async (name) => {
+        frames.forEach((f) => { f.said = []; });
         await kick();
         const rec = frames[frames.length - 1];
         if (process.env.PREVIEW) {
@@ -198,7 +209,8 @@ async function runApp(demoSetting, sent) {
         }
         return rec;
     };
-    return { clicks, tab: (i) => tab(i), shot, frames };
+    const texts = () => { const rec = frames[frames.length - 1]; return rec && rec.said ? rec.said.join(' | ') : ''; };
+    return { clicks, tab: (i) => tab(i), shot, frames, texts };
 }
 
 test('app on a real (fake) link sends only allowed reads, and draws every page', async () => {
@@ -211,6 +223,7 @@ test('app on a real (fake) link sends only allowed reads, and draws every page',
     assert.ok(sent.some(([a, s, d]) => a === 0x12 && s === 0x19 && d[0] === 0x02), 'read BMW fault memory');
     assert.ok(sent.some(([a, s]) => a === 0x12 && s === 0x22), 'identified the engine unit');
     assert.ok(sent.some(([, s]) => s === 0x07), 'read pending OBD faults');
+    assert.ok(sent.filter(([a, s, d]) => a === 0x12 && s === 0x22 && d[0] === 0xF4 && d[1] === 0x01).length >= 1, 'readiness by 22 F4 01');
     await new Promise((r) => setTimeout(r, 1500));         // the fault memory
     await app.shot('1-readiness');
     app.tab(1); await app.shot('2-faults');
@@ -221,6 +234,33 @@ test('app on a real (fake) link sends only allowed reads, and draws every page',
     await new Promise((r) => setTimeout(r, 1500));
     assert.ok(sent.length > n);
     sent.forEach(([a, s, d]) => check(a, s, d));
+});
+
+test('an engine unit that answers only service 01 still gives readiness', async () => {
+    // the demo car turned around: 01 answered, 22 F4xx refused
+    const only01 = (a, s, d) => {
+        if (s === 0x22 && d[0] === 0xF4) return [0x7F, 0x22, 0x31];
+        if (s === 0x01 && a === 0x12) { const r = DEMO.reply(a, 0x22, [0xF4, d[0]]); return r[0] === 0x62 ? [0x41].concat(r.slice(2)) : [0x7F, 0x01, 0x12]; }
+        return DEMO.reply(a, s, d);
+    };
+    const sent = [], app = await runApp('off', sent, only01);
+    await new Promise((r) => setTimeout(r, 5000));
+    sent.forEach(([a, s, d]) => check(a, s, d));
+    assert.ok(sent.filter(([a, s, d]) => a === 0x12 && s === 0x01 && d[0] === 0x01).length >= 1, 'readiness by 01 01');
+    await app.shot('x');
+    assert.ok(/monitors complete/.test(app.texts()), 'readiness shown');
+});
+
+test('no readiness answer: faults are still read, and the refusal is shown', async () => {
+    const none = (a, s, d) => (s === 0x01 || (s === 0x22 && d[0] === 0xF4) ? (a === 0x12 ? [0x7F, s, 0x11] : null) : DEMO.reply(a, s, d));
+    const sent = [], app = await runApp('off', sent, none);
+    await new Promise((r) => setTimeout(r, 6000));
+    sent.forEach(([a, s, d]) => check(a, s, d));
+    assert.ok(sent.some(([a, s, d]) => a === 0x12 && s === 0x19 && d[0] === 0x02), 'read BMW fault memory without readiness');
+    await app.shot('x');
+    assert.ok(/service not supported/.test(app.texts()), 'refusal shown');
+    app.tab(1); await app.shot('x');
+    assert.ok(/190302/.test(app.texts()), 'BMW fault shown');
 });
 
 (async () => {

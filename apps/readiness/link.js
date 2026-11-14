@@ -14,7 +14,9 @@
  *   19 02 <mask> BMW's own fault memory (UDS ReadDTCInformation, reportDTCByStatusMask): the BMW hex codes
  *                (140300 ...) BMW's tools show. Only sub-function 02; 19 has no sub-function that changes
  *                anything, and clearing (14) is a different service, not allowed.
- *   22 F1 50     the unit's SGBD index (which engine / gearbox type it is: picks its fault texts). Only F1 50.
+ *   22 F1 50     the unit's SGBD index (which engine / gearbox type it is: picks its fault texts).
+ *   22 F4 <PID>  the same OBD-II data as 01 <PID>, as a UDS identifier (ISO 27145): what most BMW engine units
+ *                answer over the head unit's link (01 is often refused with NRC 11). Same PIDs as 01 only.
  *
  * Only to the units in UNITS (engine unit, second engine unit, gearbox), physically, never to all at once.
  * No session change, no tester present, no clear (04 / 14), no other 22 identifier, no 2E / 2F / 31 / anything
@@ -50,7 +52,8 @@ function check(target, sid, data) {
         return;
     }
     if (sid === 0x22) {
-        if (data.length !== 2 || data[0] !== 0xF1 || data[1] !== 0x50) throw new Error('read-only: 22 ' + data.map(hx).join(' ') + ' is not allowed (only 22 F1 50)');
+        const ok = data.length === 2 && ((data[0] === 0xF1 && data[1] === 0x50) || (data[0] === 0xF4 && PIDS.indexOf(data[1]) >= 0));
+        if (!ok) throw new Error('read-only: 22 ' + data.map(hx).join(' ') + ' is not allowed (only 22 F1 50 and 22 F4 <PID>)');
         return;
     }
     throw new Error('read-only: service ' + hx(sid) + ' is not allowed');
@@ -83,6 +86,9 @@ class ReadinessLink {
 
     async init() { await LINKS.get(this).init(); return this; }
     get available() { return LINKS.get(this).available; }
+    /** the transport proxy is there (false while init runs, or when the head unit has none: see failed) */
+    get ready() { return !!LINKS.get(this).p; }
+    get failed() { return LINKS.get(this).error; }
     silent(target) { return (this.misses[target] || 0) >= this.silentAfter; }
     wake(target) { if (target === undefined) this.misses = {}; else delete this.misses[target]; }
 

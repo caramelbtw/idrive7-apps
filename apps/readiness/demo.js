@@ -20,17 +20,19 @@ function bits(base, pids) {
 function reply(addr, sid, data) {
     const s = (Date.now() - T0) / 1000;
     const index = { 0x12: [0x0F, 0x26, 0xE8], 0x18: [0x0F, 0x14, 0xB8] }[addr];
-    if (sid === 0x22 && index) return [0x62, 0xF1, 0x50].concat(index);
+    if (sid === 0x22 && index && data[0] === 0xF1) return [0x62, 0xF1, 0x50].concat(index);
     if (sid === 0x19 && index) {
         // 59 02 <availability mask> then <3-byte code> <status> each
         const out = [0x59, 0x02, 0xFF];
         if (addr === 0x12) out.push(0x19, 0x03, 0x02, 0x04, 0x15, 0x42, 0x01, 0x08);
         return out;
     }
-    if (addr === 0x18) return sid === 0x01 ? [0x7F, 0x01, 0x11] : [sid + 0x40, 0x00];
+    if (addr === 0x18) return sid === 0x01 || sid === 0x22 ? [0x7F, sid, sid === 0x22 ? 0x31 : 0x11] : [sid + 0x40, 0x00];
     if (addr !== 0x12) return null;
-    if (sid === 0x01) {
-        const pid = data[0], head = [0x41, pid];
+    // as most BMW engine units over this link: OBD data only as UDS identifiers 22 F4 <PID>, service 01 refused
+    if (sid === 0x01) return [0x7F, 0x01, 0x11];
+    if (sid === 0x22 && data[0] === 0xF4) {
+        const pid = data[1], head = [0x62, 0xF4, pid];
         // B: misfire, fuel, components monitored and complete; C: catalyst, evap, secondary air, O2, O2 heater
         let D = 0x04;                                  // evap incomplete
         if (s < 90) D |= 0x01;                         // catalyst
@@ -43,7 +45,7 @@ function reply(addr, sid, data) {
         if (pid === 0x30) return head.concat([9]);
         if (pid === 0x31) return head.concat(be16(186 + Math.floor(s / 60)));
         if (pid === 0x4E) return head.concat(be16(412 + Math.floor(s / 60)));
-        return [0x7F, 0x01, 0x12];
+        return [0x7F, 0x22, 0x31];
     }
     if (sid === 0x03 || sid === 0x07 || sid === 0x0A) return [sid + 0x40, 0x00];
     return null;
