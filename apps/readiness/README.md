@@ -38,8 +38,9 @@ the same as Fault Scanner's *Current*).
 - **Texts.** These come from `bmw_dtc.pack`, the engine unit and gearbox part of Fault Scanner's committed database
   (about 22,000 codes, 48 engine and gearbox types, 1.1 MB). The app first asks each unit for its type
   (`22 F1 50`), so the text matches that exact engine or gearbox. If the type isn't known, it falls back to the text
-  every type at that address agrees on. After Fault Scanner's database is updated, run
-  `python3 kit/tools/readiness_texts.py` to rebuild the pack.
+  every type at that address agrees on. Fault Scanner isn't in this repository; after its database is updated
+  upstream, run `python3 kit/tools/readiness_texts.py <path to upstream apps/dtc_scanner/dtc_db.pack>` to rebuild
+  the pack.
 - **Readiness system.** Each code is linked to a readiness system using the subject of its BMW text, the part before
   the colon. For example, "Oxygen sensor heating, ...: Circuit open" belongs to *Oxygen sensor heater*, and
   "DMTL, ..." or "Tank vent valve, ..." belongs to *Evaporative system*. A fault that only mentions a system in its

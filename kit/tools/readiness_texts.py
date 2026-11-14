@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """readiness_texts.py - the BMW fault texts Readiness needs, taken from Fault Scanner's database.
 
-    python3 kit/tools/readiness_texts.py      # apps/dtc_scanner/dtc_db.pack -> apps/readiness/bmw_dtc.pack
+    python3 kit/tools/readiness_texts.py [dtc_db.pack]   # Fault Scanner's database -> apps/readiness/bmw_dtc.pack
+
+Fault Scanner isn't in this repository: pass the path of apps/dtc_scanner/dtc_db.pack from a checkout of
+https://github.com/cauliflowermossgrape/idrive7-apps (default: that path here, if you've copied it in).
 
 Readiness reads BMW's own fault memory (UDS 19 02) of the engine unit(s) (0x12, 0x13) and the gearbox (0x18).
 Their codes are BMW hex codes (140300, 1F2501 ...), not P-codes, and only a text database names them. This keeps
@@ -51,9 +54,10 @@ def read_pack(path):
 
 
 def main():
-    if not os.path.exists(SRC):
-        sys.exit('missing ' + SRC)
-    get = read_pack(SRC)
+    src = sys.argv[1] if len(sys.argv) > 1 else SRC
+    if not os.path.exists(src):
+        sys.exit('missing ' + src + ' (pass the path of Fault Scanner's dtc_db.pack from the upstream repository)')
+    get = read_pack(src)
     index = {k: v for k, v in (get('sgbd_index.json') or {}).items() if k.split(' ')[0] in ADDRS}
     tmp = tempfile.mkdtemp()
     try:
