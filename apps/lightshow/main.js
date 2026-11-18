@@ -270,34 +270,46 @@ mgu.run({
             var raw = block ? C.readBits(block, opt) : null;
             var curLabel = raw !== null ? C.label(opt, raw) : '--';
 
-            cv.text('DRL BRIGHTNESS', 48, 140, 20, t.dim, { font: 'bold', spacing: 1 });
-            cv.text('Daytime running light LED brightness (both sides)', 48, 162, 16, t.dim);
+            // centered layout
+            var cx = 800, cardW = 700;
+            var lx = cx - cardW / 2;
 
-            // current value display
-            G.panel(cv, t, 40, 180, 500, 80, null);
-            cv.text('Current:', 64, 220, 20, t.dim);
-            cv.text(curLabel, 200, 224, 28, t.accent2 || t.accent, { font: 'bold' });
+            // title block
+            cv.text('DRL BRIGHTNESS', cx, 100, 24, t.text, { align: 'center', font: 'bold', spacing: 2 });
+            cv.text('Daytime running light LED brightness (both headlight modules)', cx, 128, 16, t.dim, { align: 'center' });
 
-            // brightness options as cards
+            // current value — large centered readout
+            cv.text(curLabel, cx, 196, 48, t.accent2 || t.accent, { align: 'center', font: 'bold' });
+            cv.fillRect(cx - 60, 210, 120, 2, withAlpha(t.accent2 || t.accent, 0.3));
+
+            // brightness options
             var choices = opt.choices;
+            var cardH = 46;
+            var gap = 8;
+            var startY = 240;
             for (var i = 0; i < choices.length; i++) {
-                var y = 280 + i * 44;
+                var y = startY + i * (cardH + gap);
                 var isCur = raw === choices[i].value;
-                var bg = isCur ? withAlpha(t.accent2 || t.accent, 0.15) : withAlpha(t.text, 0.04);
-                cv.roundRect(40, y, 500, 38, 8, bg);
-                if (isCur) cv.fillRect(40, y, 4, 38, t.accent2 || t.accent);
+                var bg = isCur ? withAlpha(t.accent2 || t.accent, 0.12) : withAlpha(t.text, 0.03);
+                cv.roundRect(lx, y, cardW, cardH, 10, bg);
+                if (isCur) cv.fillRect(lx, y, 5, cardH, t.accent2 || t.accent);
 
-                cv.text(choices[i].label, 64, y + 26, 22, isCur ? (t.accent2 || t.accent) : t.text, { font: isCur ? 'bold' : 'normal' });
+                cv.text(choices[i].label, lx + 32, y + 30, 22, isCur ? (t.accent2 || t.accent) : t.text, { font: isCur ? 'bold' : 'normal' });
 
                 // brightness bar
                 var pct = choices[i].value;
-                var barW = Math.round(200 * pct / 100);
-                cv.roundRect(320, y + 10, 200, 18, 4, withAlpha(t.dim, 0.15));
+                var barTrackW = 320;
+                var barX = lx + cardW - barTrackW - 32;
+                var barW = Math.round(barTrackW * pct / 100);
+                cv.roundRect(barX, y + 16, barTrackW, 14, 7, withAlpha(t.dim, 0.12));
                 if (barW > 0) {
-                    cv.roundRect(320, y + 10, barW, 18, 4, isCur ? (t.accent2 || t.accent) : withAlpha(t.text, 0.3));
+                    cv.roundRect(barX, y + 16, barW, 14, 7, isCur ? (t.accent2 || t.accent) : withAlpha(t.text, 0.2));
                 }
 
-                drlTapTargets.push({ index: i, y: y, h: 38, value: choices[i].value });
+                // percentage on the right
+                cv.text(pct + '%', lx + cardW - 10, y + 30, 16, isCur ? (t.accent2 || t.accent) : t.dim, { align: 'right', font: 'bold' });
+
+                drlTapTargets.push({ index: i, y: y, h: cardH, value: choices[i].value });
             }
         }
 
