@@ -70,8 +70,25 @@ mgu.run({
                 changed();
                 return;
             }
-            var ok = 0;
+
+            // probe which ECUs are reachable via TASU
+            var reached = [];
+            var probes = [0x40, C.ECU.FLM_L, C.ECU.FLM_R];
+            for (var p = 0; p < probes.length; p++) {
+                try {
+                    var id = await L.identify(probes[p]);
+                    if (id) reached.push(probes[p].toString(16));
+                } catch (e) {}
+            }
+            log.info('TASU probe: reached [' + reached.join(', ') + ']');
+
+            // enter extended session on FLM before reading coding data
             var ecus = [C.ECU.FLM_L, C.ECU.FLM_R];
+            for (var s = 0; s < ecus.length; s++) {
+                try { await L.ask(ecus[s], 0x10, [0x03]); } catch (e) {}
+            }
+
+            var ok = 0;
             for (var i = 0; i < ecus.length; i++) {
                 var ecu = ecus[i];
                 try {
@@ -84,8 +101,17 @@ mgu.run({
                     log.warn('FLM read ' + ecu.toString(16) + ': ' + e);
                 }
             }
+
+            // return to default session
+            for (var d = 0; d < ecus.length; d++) {
+                try { await L.ask(ecus[d], 0x10, [0x01]); } catch (e) {}
+            }
+
             phase = ok > 0 ? 'ready' : 'error';
-            if (!ok) { statusMsg = 'FLM 0x43/0x44 no answer'; statusAt = Date.now(); }
+            if (!ok) {
+                statusMsg = reached.length ? 'BDC ok, FLM no answer' : 'No ECU reachable via TASU';
+                statusAt = Date.now();
+            }
             lastRead = Date.now();
             changed();
         }
