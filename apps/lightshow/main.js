@@ -21,25 +21,15 @@ mgu.run({
     async start(ctx) {
         const { ui, settings, log } = ctx;
         const diagLink = new CoderLink(ctx.signals, log);
-        var linkReady = false;
-        var linkInitPending = false;
+        var linkInited = false;
 
         async function ensureLink() {
-            if (linkReady) return true;
-            if (linkInitPending) return false;
-            linkInitPending = true;
-            try {
+            if (!linkInited) {
+                linkInited = true;
                 await diagLink.init();
-                linkReady = true;
-                log.info('diagnostic link ready');
-                return true;
-            } catch (e) {
-                log.warn('diagnostic link: ' + e);
-                linkReady = false;
-                return false;
-            } finally {
-                linkInitPending = false;
+                log.info('TASU init done: ready=' + diagLink.ready + ' available=' + diagLink.available + ' failed=' + diagLink.failed);
             }
+            return diagLink.ready;
         }
         ensureLink();
         const link = function () { return diagLink; };
@@ -71,24 +61,31 @@ mgu.run({
             if (phase === 'reading') return;
             phase = 'reading'; changed();
             var linked = await ensureLink();
+            var L = link();
             if (!linked) {
-                phase = 'idle';
+                phase = 'error';
+                statusMsg = L.failed ? 'TASU: ' + L.failed : 'TASU not ready';
+                statusAt = Date.now();
+                lastRead = Date.now();
                 changed();
                 return;
             }
-            var L = link();
             var ok = 0;
             var ecus = [C.ECU.FLM_L, C.ECU.FLM_R];
             for (var i = 0; i < ecus.length; i++) {
                 var ecu = ecus[i];
-                var block = await L.readDid(ecu, '3100');
-                if (block) {
-                    blocks[ecu + ':3100'] = block;
-                    ok++;
+                try {
+                    var block = await L.readDid(ecu, '3100');
+                    if (block) {
+                        blocks[ecu + ':3100'] = block;
+                        ok++;
+                    }
+                } catch (e) {
+                    log.warn('FLM read ' + ecu.toString(16) + ': ' + e);
                 }
             }
             phase = ok > 0 ? 'ready' : 'error';
-            if (!ok) statusMsg = 'FLM not responding';
+            if (!ok) { statusMsg = 'FLM 0x43/0x44 no answer'; statusAt = Date.now(); }
             lastRead = Date.now();
             changed();
         }
@@ -96,11 +93,11 @@ mgu.run({
         async function poll() {
             if (!ui.isVisible('MAIN')) return;
             if (phase === 'reading') return;
-            if (phase === 'idle' || (phase === 'error' && Date.now() - lastRead > 5000) || Date.now() - lastRead > 60000) {
+            if (phase === 'idle' || phase === 'error' || Date.now() - lastRead > 30000) {
                 await readDrl();
             }
         }
-        setInterval(poll, 3000);
+        setInterval(poll, 4000);
 
         /* ---------- DRL write ---------- */
         async function writeDrl(newValue) {
@@ -391,7 +388,7 @@ mgu.run({
         ui.onClick('BTN_REFRESH', function () {
             phase = 'idle';
             blocks = {};
-            linkReady = false;
+            linkInited = false;
             diagLink.wake();
             poll();
             changed();
