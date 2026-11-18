@@ -21,7 +21,27 @@ mgu.run({
     async start(ctx) {
         const { ui, settings, log } = ctx;
         const diagLink = new CoderLink(ctx.signals, log);
-        diagLink.init().catch(function (e) { log.warn('diagnostic link: ' + e); });
+        var linkReady = false;
+        var linkInitPending = false;
+
+        async function ensureLink() {
+            if (linkReady) return true;
+            if (linkInitPending) return false;
+            linkInitPending = true;
+            try {
+                await diagLink.init();
+                linkReady = true;
+                log.info('diagnostic link ready');
+                return true;
+            } catch (e) {
+                log.warn('diagnostic link: ' + e);
+                linkReady = false;
+                return false;
+            } finally {
+                linkInitPending = false;
+            }
+        }
+        ensureLink();
         const link = function () { return diagLink; };
 
         /* ---------- state ---------- */
@@ -50,13 +70,13 @@ mgu.run({
         async function readDrl() {
             if (phase === 'reading') return;
             phase = 'reading'; changed();
-            var L = link();
-            if (!L.ready) {
-                if (L.failed) { phase = 'error'; statusMsg = 'No diagnostic link (' + L.failed + ')'; }
-                else phase = 'idle';
+            var linked = await ensureLink();
+            if (!linked) {
+                phase = 'idle';
                 changed();
                 return;
             }
+            var L = link();
             var ok = 0;
             var ecus = [C.ECU.FLM_L, C.ECU.FLM_R];
             for (var i = 0; i < ecus.length; i++) {
@@ -68,7 +88,7 @@ mgu.run({
                 }
             }
             phase = ok > 0 ? 'ready' : 'error';
-            if (!ok) statusMsg = 'No FLM answered';
+            if (!ok) statusMsg = 'FLM not responding';
             lastRead = Date.now();
             changed();
         }
@@ -76,11 +96,11 @@ mgu.run({
         async function poll() {
             if (!ui.isVisible('MAIN')) return;
             if (phase === 'reading') return;
-            if (phase === 'idle' || phase === 'error' || Date.now() - lastRead > 60000) {
+            if (phase === 'idle' || (phase === 'error' && Date.now() - lastRead > 5000) || Date.now() - lastRead > 60000) {
                 await readDrl();
             }
         }
-        setInterval(poll, 2000);
+        setInterval(poll, 3000);
 
         /* ---------- DRL write ---------- */
         async function writeDrl(newValue) {
@@ -371,6 +391,7 @@ mgu.run({
         ui.onClick('BTN_REFRESH', function () {
             phase = 'idle';
             blocks = {};
+            linkReady = false;
             diagLink.wake();
             poll();
             changed();
