@@ -2,7 +2,7 @@
   "id": "lightshow",
   "title": "LightShow",
   "description": "BMW light show sequencer and DRL control for G01 X3 on iDrive 7 / iDrive 8",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "vendor": "custom",
   "loggingId": "OAA7",
   "iconGlyph": "ambient",

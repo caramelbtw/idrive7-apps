@@ -132,15 +132,14 @@ mgu.run({
         /* ---------- drawing ---------- */
 
         function drawHeader(cv, t) {
-            G.panel(cv, t, 24, 44, 1552, 56, null);
+            G.panel(cv, t, 24, 44, 1552, 48, null);
             var title = page === 0 ? 'LIGHT SHOW' : 'DRL CONTROL';
-            cv.text(title, 48, 82, 28, t.text, { font: 'bold', spacing: 2 });
+            cv.text(title, 48, 78, 22, t.text, { font: 'bold', spacing: 2 });
 
-            // connection status
             var demo = useDemo();
             var conn = phase === 'ready' ? (demo ? 'DEMO' : 'CONNECTED') : phase === 'reading' ? 'READING...' : phase === 'error' ? 'NO LINK' : 'CONNECTING...';
             var connColor = phase === 'ready' ? (demo ? t.warn : '#2fd27a') : phase === 'error' ? t.crit : t.dim;
-            cv.text(conn, 1552, 82, 18, connColor, { align: 'right', font: 'bold', spacing: 1 });
+            cv.text(conn, 1552, 78, 14, connColor, { align: 'right', font: 'bold', spacing: 1 });
         }
 
         // ---- Strobe page ----
@@ -152,39 +151,35 @@ mgu.run({
             patternTapTargets = [];
             controlTapTargets = [];
 
-            // pattern list (left column)
-            cv.text('PATTERNS', 48, 132, 18, t.dim, { font: 'bold', spacing: 1 });
+            cv.text('PATTERNS', 48, 126, 14, t.dim, { font: 'bold', spacing: 1 });
             for (var i = 0; i < S.PATTERNS.length; i++) {
                 var pat = S.PATTERNS[i];
-                var y = 148 + i * 42;
+                var y = 140 + i * 38;
                 var isActive = sequencer.running && sequencer.pattern && sequencer.pattern.id === pat.id;
                 var isSelected = i === selectedPattern;
 
                 var bg = isActive ? withAlpha(t.accent2 || t.accent, 0.2) : isSelected ? withAlpha(t.text, 0.08) : withAlpha(t.text, 0.03);
-                cv.roundRect(40, y, 500, 36, 8, bg);
-                if (isActive) cv.fillRect(40, y, 4, 36, t.accent2 || t.accent);
-                else if (isSelected) cv.fillRect(40, y, 4, 36, t.dim);
+                cv.roundRect(40, y, 480, 32, 6, bg);
+                if (isActive) cv.fillRect(40, y, 3, 32, t.accent2 || t.accent);
+                else if (isSelected) cv.fillRect(40, y, 3, 32, t.dim);
 
-                cv.text(pat.name, 56, y + 24, 20, isActive ? (t.accent2 || t.accent) : t.text, { font: isActive ? 'bold' : 'normal' });
-                cv.text(pat.description, 56, y + 36, 13, t.dim);
+                cv.text(pat.name, 54, y + 20, 16, isActive ? (t.accent2 || t.accent) : t.text, { font: isActive ? 'bold' : 'normal' });
+                cv.text(pat.description, 54, y + 31, 11, t.dim);
 
-                patternTapTargets.push({ index: i, y: y, h: 36 });
+                patternTapTargets.push({ index: i, y: y, h: 32 });
             }
 
-            // controls (right side)
-            var cx = 620, cy = 148;
+            var cx = 580, cy = 140;
 
-            // play / stop button
-            var btnW = 200, btnH = 48;
+            var btnW = 180, btnH = 40;
             var btnColor = sequencer.running ? t.crit : (t.accent2 || t.accent);
-            cv.roundRect(cx, cy, btnW, btnH, 10, btnColor);
+            cv.roundRect(cx, cy, btnW, btnH, 8, btnColor);
             var btnLabel = sequencer.running ? 'STOP' : 'PLAY';
-            cv.text(btnLabel, cx + btnW / 2, cy + 32, 24, '#FFFFFF', { align: 'center', font: 'bold' });
+            cv.text(btnLabel, cx + btnW / 2, cy + 27, 18, '#FFFFFF', { align: 'center', font: 'bold' });
             controlTapTargets.push({ id: 'play_stop', x: cx, y: cy, w: btnW, h: btnH });
 
-            // speed control
-            cy += 70;
-            cv.text('SPEED', cx, cy + 16, 16, t.dim, { font: 'bold', spacing: 1 });
+            cy += 56;
+            cv.text('SPEED', cx, cy + 13, 12, t.dim, { font: 'bold', spacing: 1 });
             var speeds = [
                 { label: '2x', value: 0.5 },
                 { label: '1.5x', value: 0.67 },
@@ -193,20 +188,19 @@ mgu.run({
                 { label: '0.5x', value: 2.0 },
             ];
             for (var si = 0; si < speeds.length; si++) {
-                var sx = cx + si * 80;
-                var sy = cy + 28;
+                var sx = cx + si * 72;
+                var sy = cy + 22;
                 var isCur = Math.abs(strobeSpeed - speeds[si].value) < 0.05;
                 var pillBg = isCur ? (t.accent2 || t.accent) : withAlpha(t.text, 0.08);
                 var pillTxt = isCur ? '#FFFFFF' : t.text;
-                cv.roundRect(sx, sy, 68, 30, 6, pillBg);
-                cv.text(speeds[si].label, sx + 34, sy + 21, 16, pillTxt, { align: 'center', font: isCur ? 'bold' : 'normal' });
-                controlTapTargets.push({ id: 'speed_' + si, x: sx, y: sy, w: 68, h: 30, speedValue: speeds[si].value });
+                cv.roundRect(sx, sy, 62, 26, 5, pillBg);
+                cv.text(speeds[si].label, sx + 31, sy + 18, 13, pillTxt, { align: 'center', font: isCur ? 'bold' : 'normal' });
+                controlTapTargets.push({ id: 'speed_' + si, x: sx, y: sy, w: 62, h: 26, speedValue: speeds[si].value });
             }
 
-            // live light visualisation
-            cy += 80;
-            cv.text('LIVE', cx, cy + 16, 16, t.dim, { font: 'bold', spacing: 1 });
-            drawLightViz(cv, t, cx, cy + 28);
+            cy += 68;
+            cv.text('LIVE', cx, cy + 13, 12, t.dim, { font: 'bold', spacing: 1 });
+            drawLightViz(cv, t, cx, cy + 22);
         }
 
         function drawLightViz(cv, t, ox, oy) {
@@ -215,8 +209,7 @@ mgu.run({
             cv.roundRect(ox, oy, carW, carH, 12, withAlpha(t.text, 0.04));
             cv.roundRect(ox + 1, oy + 1, carW - 2, carH - 2, 12, 'transparent');
 
-            // car label
-            cv.text('G01', ox + carW / 2, oy + carH / 2 + 6, 20, withAlpha(t.dim, 0.3), { align: 'center', font: 'bold' });
+            cv.text('G01', ox + carW / 2, oy + carH / 2 + 5, 16, withAlpha(t.dim, 0.3), { align: 'center', font: 'bold' });
 
             var onSet = {};
             for (var a = 0; a < activeOnIds.length; a++) onSet[activeOnIds[a]] = true;
@@ -251,10 +244,10 @@ mgu.run({
 
             // light labels (tiny, below the viz)
             if (!sequencer.running) {
-                cv.text('Tap a pattern and press PLAY', ox + carW / 2, oy + carH + 18, 14, withAlpha(t.dim, 0.5), { align: 'center' });
+                cv.text('Tap a pattern and press PLAY', ox + carW / 2, oy + carH + 16, 11, withAlpha(t.dim, 0.5), { align: 'center' });
             } else {
                 var pat = sequencer.pattern;
-                cv.text(pat ? pat.name : '', ox + carW / 2, oy + carH + 18, 14, t.accent2 || t.accent, { align: 'center', font: 'bold' });
+                cv.text(pat ? pat.name : '', ox + carW / 2, oy + carH + 16, 12, t.accent2 || t.accent, { align: 'center', font: 'bold' });
             }
         }
 
@@ -269,48 +262,49 @@ mgu.run({
             var block = blocks[key];
             var raw = block ? C.readBits(block, opt) : null;
             var curLabel = raw !== null ? C.label(opt, raw) : '--';
+            var accent = t.accent2 || t.accent;
 
-            // centered layout
-            var cx = 800, cardW = 700;
-            var lx = cx - cardW / 2;
+            var cx = 800;
 
-            // title block
-            cv.text('DRL BRIGHTNESS', cx, 100, 24, t.text, { align: 'center', font: 'bold', spacing: 2 });
-            cv.text('Daytime running light LED brightness (both headlight modules)', cx, 128, 16, t.dim, { align: 'center' });
+            cv.text('DRL BRIGHTNESS', cx, 120, 18, t.text, { align: 'center', font: 'bold', spacing: 2 });
+            cv.text('Daytime running light LED intensity', cx, 142, 12, t.dim, { align: 'center' });
 
-            // current value — large centered readout
-            cv.text(curLabel, cx, 196, 48, t.accent2 || t.accent, { align: 'center', font: 'bold' });
-            cv.fillRect(cx - 60, 210, 120, 2, withAlpha(t.accent2 || t.accent, 0.3));
+            // large readout
+            cv.text(curLabel, cx, 210, 40, accent, { align: 'center', font: 'bold' });
+            cv.fillRect(cx - 50, 222, 100, 2, withAlpha(accent, 0.25));
 
-            // brightness options
+            // brightness bar visualisation
+            var barTrackW = 500, barH = 10;
+            var barX = cx - barTrackW / 2;
+            var barY = 248;
+            var pctVal = raw !== null ? raw : 0;
+            var barW = Math.round(barTrackW * pctVal / 100);
+            cv.roundRect(barX, barY, barTrackW, barH, 5, withAlpha(t.dim, 0.1));
+            if (barW > 0) cv.roundRect(barX, barY, barW, barH, 5, withAlpha(accent, 0.5));
+
+            // quick-select pills
             var choices = opt.choices;
-            var cardH = 46;
-            var gap = 8;
-            var startY = 240;
+            var pillW = 90, pillH = 36, pillGap = 12;
+            var totalW = choices.length * pillW + (choices.length - 1) * pillGap;
+            var startX = cx - totalW / 2;
+            var pillY = 284;
+
             for (var i = 0; i < choices.length; i++) {
-                var y = startY + i * (cardH + gap);
+                var px = startX + i * (pillW + pillGap);
                 var isCur = raw === choices[i].value;
-                var bg = isCur ? withAlpha(t.accent2 || t.accent, 0.12) : withAlpha(t.text, 0.03);
-                cv.roundRect(lx, y, cardW, cardH, 10, bg);
-                if (isCur) cv.fillRect(lx, y, 5, cardH, t.accent2 || t.accent);
-
-                cv.text(choices[i].label, lx + 32, y + 30, 22, isCur ? (t.accent2 || t.accent) : t.text, { font: isCur ? 'bold' : 'normal' });
-
-                // brightness bar
-                var pct = choices[i].value;
-                var barTrackW = 320;
-                var barX = lx + cardW - barTrackW - 32;
-                var barW = Math.round(barTrackW * pct / 100);
-                cv.roundRect(barX, y + 16, barTrackW, 14, 7, withAlpha(t.dim, 0.12));
-                if (barW > 0) {
-                    cv.roundRect(barX, y + 16, barW, 14, 7, isCur ? (t.accent2 || t.accent) : withAlpha(t.text, 0.2));
+                var bg = isCur ? accent : withAlpha(t.text, 0.06);
+                cv.roundRect(px, pillY, pillW, pillH, 8, bg);
+                if (isCur) {
+                    cv.roundRect(px - 1, pillY - 1, pillW + 2, pillH + 2, 9, withAlpha(accent, 0.3));
+                    cv.roundRect(px, pillY, pillW, pillH, 8, accent);
                 }
-
-                // percentage on the right
-                cv.text(pct + '%', lx + cardW - 10, y + 30, 16, isCur ? (t.accent2 || t.accent) : t.dim, { align: 'right', font: 'bold' });
-
-                drlTapTargets.push({ index: i, y: y, h: cardH, value: choices[i].value });
+                var label = choices[i].value + '%';
+                cv.text(label, px + pillW / 2, pillY + 24, 15, isCur ? '#FFFFFF' : t.text, { align: 'center', font: isCur ? 'bold' : 'normal' });
+                drlTapTargets.push({ index: i, x: px, y: pillY, w: pillW, h: pillH, value: choices[i].value });
             }
+
+            // hint
+            cv.text('Applies to both FLM headlight modules', cx, 346, 11, withAlpha(t.dim, 0.5), { align: 'center' });
         }
 
         function drawStatus(cv, t) {
@@ -319,7 +313,7 @@ mgu.run({
             var alpha = Math.min(1, fade);
             var bg = writing ? withAlpha(t.warn, 0.15 * alpha) : withAlpha(t.text, 0.08 * alpha);
             cv.roundRect(40, H - 56, 1520, 40, 8, bg);
-            cv.text(statusMsg, 800, H - 28, 20, withAlpha(t.text, alpha), { align: 'center' });
+            cv.text(statusMsg, 800, H - 30, 14, withAlpha(t.text, alpha), { align: 'center' });
         }
 
         var drawn = -1;
@@ -344,7 +338,7 @@ mgu.run({
                 // pattern selection
                 for (var i = 0; i < patternTapTargets.length; i++) {
                     var pt = patternTapTargets[i];
-                    if (y >= pt.y && y < pt.y + pt.h && x >= 40 && x < 540) {
+                    if (y >= pt.y && y < pt.y + pt.h && x >= 40 && x < 520) {
                         selectedPattern = pt.index;
                         changed();
                         return;
@@ -368,10 +362,9 @@ mgu.run({
                     }
                 }
             } else if (page === 1) {
-                // DRL brightness selection
                 for (var k = 0; k < drlTapTargets.length; k++) {
                     var dt = drlTapTargets[k];
-                    if (y >= dt.y && y < dt.y + dt.h && x >= 40 && x < 540) {
+                    if (x >= dt.x && x < dt.x + dt.w && y >= dt.y && y < dt.y + dt.h) {
                         writeDrl(dt.value);
                         return;
                     }
