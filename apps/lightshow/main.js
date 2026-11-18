@@ -12,7 +12,6 @@ const { withAlpha } = require('./kit/canvas');
 const { fitText } = require('./kit/text-layout');
 const C = require('./coding');
 const { CoderLink, TARGETS } = require('./link');
-const { DemoLink, ecuName } = require('./demo');
 const S = require('./strobe');
 
 const W = 1600, H = 520;
@@ -21,11 +20,9 @@ const TABS = ['Strobe', 'DRL'];
 mgu.run({
     async start(ctx) {
         const { ui, settings, log } = ctx;
-        const realLink = new CoderLink(ctx.signals, log);
-        realLink.init().catch(function (e) { log.warn('diagnostic link: ' + e); });
-        const demoLink = new DemoLink(log);
-        const useDemo = function () { return settings.get('demo') === 'on' || (settings.get('demo') === 'auto' && !realLink.available); };
-        const link = function () { return useDemo() ? demoLink : realLink; };
+        const diagLink = new CoderLink(ctx.signals, log);
+        diagLink.init().catch(function (e) { log.warn('diagnostic link: ' + e); });
+        const link = function () { return diagLink; };
 
         /* ---------- state ---------- */
         var page = 0, version = 0;
@@ -54,7 +51,7 @@ mgu.run({
             if (phase === 'reading') return;
             phase = 'reading'; changed();
             var L = link();
-            if (!useDemo() && !L.ready) {
+            if (!L.ready) {
                 if (L.failed) { phase = 'error'; statusMsg = 'No diagnostic link (' + L.failed + ')'; }
                 else phase = 'idle';
                 changed();
@@ -136,9 +133,8 @@ mgu.run({
             var title = page === 0 ? 'LIGHT SHOW' : 'DRL CONTROL';
             cv.text(title, 48, 78, 22, t.text, { font: 'bold', spacing: 2 });
 
-            var demo = useDemo();
-            var conn = phase === 'ready' ? (demo ? 'DEMO' : 'CONNECTED') : phase === 'reading' ? 'READING...' : phase === 'error' ? 'NO LINK' : 'CONNECTING...';
-            var connColor = phase === 'ready' ? (demo ? t.warn : '#2fd27a') : phase === 'error' ? t.crit : t.dim;
+            var conn = phase === 'ready' ? 'CONNECTED' : phase === 'reading' ? 'READING...' : phase === 'error' ? 'NO LINK' : 'CONNECTING...';
+            var connColor = phase === 'ready' ? '#2fd27a' : phase === 'error' ? t.crit : t.dim;
             cv.text(conn, 1552, 78, 14, connColor, { align: 'right', font: 'bold', spacing: 1 });
         }
 
@@ -325,7 +321,7 @@ mgu.run({
             if (page === 0) drawStrobePage(cv, t);
             else drawDrlPage(cv, t);
             drawStatus(cv, t);
-            var badges = [useDemo() && { text: 'DEMO' }];
+            var badges = [];
             if (sequencer.running) badges.push({ text: 'PLAYING', color: 'accent2' });
             if (writing) badges.push({ text: 'WRITING', color: 'accent2' });
             G.frame(cv, t, TABS, page, badges);
@@ -375,7 +371,7 @@ mgu.run({
         ui.onClick('BTN_REFRESH', function () {
             phase = 'idle';
             blocks = {};
-            realLink.wake();
+            diagLink.wake();
             poll();
             changed();
         });
@@ -391,9 +387,6 @@ mgu.run({
         ctx.onLayout(changed);
         settings.onChange(function () {
             if (sequencer.running) stopStrobe();
-            blocks = {};
-            phase = 'idle';
-            sequencer.link = link();
             changed();
         });
 
