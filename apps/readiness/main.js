@@ -39,7 +39,7 @@ const GO = '#2fd27a';
 const ENGINES = [0x12, 0x13];
 const READ_MS = 10000, SLOW_MS = 30000;
 const BMW_MASK = 0x0C;            // 19 02 status mask: pending and confirmed (stored) faults, as Fault Scanner's "Current"
-const TABS = ['Readiness', 'Faults', 'Drive plan', 'Probe'];
+const TABS = ['Readiness', 'Faults', 'Drive plan', 'Probe', 'Sweep'];
 const PLAN_PER_PAGE = 4;
 const PROBE_PER_PAGE = 14;
 
@@ -67,10 +67,11 @@ mgu.run({
                 types: {},                 // address -> unit type (DME8FF_R ...) or '' (22 F1 50 once; picks BMW texts)
                 faults: null,              // [{ code, text, system, systemName, unit, label, sev, bmw }] (see readFaults)
                 readAt: 0, slowAt: 0, error: '',
-                probe: null,               // { rows: [{ section, label, req, resp, detail }], step, done }
+                probe: null,               // { rows: [{ section, label, req, detail, err }], step, done }
+                sweep: null,               // { hits: [{ did, hex, data, len }], step, done, ranges, total, scanned }
             };
         }
-        let page = 0, planPage = 0, probePage = 0, version = 0, busy = false, forced = false, probing = false;
+        let page = 0, planPage = 0, probePage = 0, version = 0, busy = false, forced = false, probing = false, sweeping = false;
         const changed = () => { version++; if (loop) loop.kick(); };
 
         /** one request: the demo car's reply or the real unit's (null: no answer) */
@@ -235,7 +236,7 @@ mgu.run({
 
         /** one pass: whatever is due (all of it after Refresh) */
         async function poll() {
-            if (busy || probing || !ui.isVisible('MAIN')) return;
+            if (busy || probing || sweeping || !ui.isVisible('MAIN')) return;
             busy = true;
             try {
                 const demo = useDemo();
@@ -630,6 +631,175 @@ mgu.run({
             if (pages > 1) cv.text('Page ' + (probePage + 1) + ' of ' + pages, 1552, p.y + p.h - 18, 18, t.dim, { align: 'right' });
         }
 
+        /* ---------- DID sweep ---------- */
+        const SWEEP_RANGES = [
+            [0xF400, 0xF4FF, 'ISO 27145 OBD-II (F4xx)'],
+            [0xF150, 0xF1FF, 'Identification (F1xx)'],
+            [0xD000, 0xD0FF, 'BMW live data 1 (D0xx)'],
+            [0xD100, 0xD1FF, 'BMW live data 2 (D1xx)'],
+            [0xD200, 0xD2FF, 'BMW live data 3 (D2xx)'],
+            [0xD300, 0xD3FF, 'BMW diagnostic (D3xx)'],
+            [0x1000, 0x10FF, 'Application (10xx)'],
+            [0x1800, 0x18FF, 'Application (18xx)'],
+            [0x2000, 0x20FF, 'Application (20xx)'],
+            [0x2800, 0x28FF, 'Application (28xx)'],
+            [0x3000, 0x30FF, 'Application (30xx)'],
+            [0xE000, 0xE0FF, 'BMW extended (E0xx)'],
+        ];
+        let sweepPage = 0;
+        const SWEEP_PER_PAGE = 14;
+        const fs = typeof require !== 'undefined' ? (function () { try { return require('fs'); } catch (e) { return null; } })() : null;
+
+        async function runSweep() {
+            if (sweeping) return;
+            sweeping = true;
+            link.wake();
+            const addr = 0x12;
+            const total = SWEEP_RANGES.reduce((s, r) => s + r[1] - r[0] + 1, 0);
+            const sw = { hits: [], step: 'Starting...', done: false, ranges: SWEEP_RANGES.map((r) => r[2]), total, scanned: 0, logLines: [] };
+            S.sweep = sw;
+            sweepPage = 0;
+            changed();
+
+            const h4 = (n) => n.toString(16).toUpperCase().padStart(4, '0');
+            const hxr = (u, max) => u.slice(0, max || 16).map((b) => h2(b)).join(' ') + (u.length > (max || 16) ? ' ..' : '');
+            const nrcName = (c) => NRC[c] || 'NRC ' + h2(c);
+            const logPath = ctx.dataDir + '/sweep_' + new Date().toISOString().replace(/[:.]/g, '-') + '.log';
+            const logLine = (line) => { sw.logLines.push(line); if (fs) try { fs.appendFileSync(logPath, line + '\n'); } catch (e) { /* */ } };
+
+            logLine('# DID sweep on 0x' + h2(addr) + ' at ' + new Date().toISOString());
+            logLine('# Ranges: ' + SWEEP_RANGES.map((r) => r[2] + ' ' + h4(r[0]) + '-' + h4(r[1])).join(', '));
+            logLine('# Format: DID | status | len | hex data');
+            logLine('#');
+
+            try {
+                // enter extended session first (some DIDs only appear after)
+                sw.step = 'Entering ext session...'; changed();
+                const extOk = await link.session(addr);
+                logLine('# Extended session (10 03): ' + (extOk ? 'accepted' : 'refused/no reply'));
+
+                for (const [lo, hi, label] of SWEEP_RANGES) {
+                    sw.step = label + '...'; changed();
+                    logLine('#');
+                    logLine('# --- ' + label + ' (' + h4(lo) + '-' + h4(hi) + ') ---');
+
+                    for (let did = lo; did <= hi; did++) {
+                        // re-enter ext session every 32 DIDs to keep it alive (S3 timeout ~5s)
+                        if (extOk && ((did - lo) & 0x1F) === 0 && did !== lo) await link.session(addr);
+
+                        const u = await link.sweep(addr, did);
+                        sw.scanned++;
+                        if ((sw.scanned & 0x0F) === 0) changed();
+
+                        if (!u) {
+                            logLine(h4(did) + ' | no reply |   |');
+                            continue;
+                        }
+                        if (u[0] === 0x7F) {
+                            const code = u[2];
+                            // only log non-trivial refusals (skip 0x31 not available, 0x11 not supported — they're the norm)
+                            if (code !== 0x31 && code !== 0x11 && code !== 0x12 && code !== 0x7E && code !== 0x7F) {
+                                logLine(h4(did) + ' | ' + nrcName(code).padEnd(24) + ' |   | ' + hxr(u));
+                            } else {
+                                logLine(h4(did) + ' | ' + nrcName(code).padEnd(24) + ' |   |');
+                            }
+                            continue;
+                        }
+                        // positive reply: 62 <DID hi> <DID lo> <data...>
+                        const data = u.length > 3 ? u.slice(3) : [];
+                        const hex = hxr(data, 32);
+                        logLine(h4(did) + ' | POSITIVE' + ' '.repeat(16) + ' | ' + String(data.length).padStart(2) + ' | ' + hex);
+                        sw.hits.push({ did, hex: h4(did), data: data.slice(), len: data.length, raw: hex, range: label });
+                        changed();
+                    }
+                }
+
+                // second pass: retry hits without ext session to see which need it
+                if (extOk && sw.hits.length > 0) {
+                    sw.step = 'Checking which need ext session...'; changed();
+                    logLine('#');
+                    logLine('# --- Retry hits in DEFAULT session ---');
+                    // wait for ext session to expire
+                    await sleep(6000);
+                    for (const hit of sw.hits) {
+                        const u = await link.sweep(addr, hit.did);
+                        const ok = u && u[0] !== 0x7F;
+                        hit.needsExt = !ok;
+                        logLine(hit.hex + ' | ' + (ok ? 'also in default' : 'NEEDS ext session') + ' | ' + (ok && u.length > 3 ? u.slice(3).length : '--'));
+                    }
+                }
+            } catch (e) { log.warn('sweep: ' + e); logLine('# ERROR: ' + e); }
+
+            logLine('#');
+            logLine('# Done. ' + sw.hits.length + ' positive replies out of ' + sw.scanned + ' scanned.');
+            logLine('# Hits: ' + sw.hits.map((h) => h.hex).join(', '));
+            sw.step = '';
+            sw.done = true;
+            sweeping = false;
+            changed();
+            log.info('sweep done: ' + sw.hits.length + ' hits, log at ' + logPath);
+        }
+
+        function drawSweep(cv, t) {
+            const ERR_COLOR = '#e05555';
+            const p = G.panel(cv, t, 24, 44, 1552, 468, 'DID Sweep — Engine 0x12');
+
+            const sw = S.sweep;
+            if (!sw) {
+                cv.text('Press Refresh to sweep all BMW DID ranges on the engine unit.', 48, 160, 22, t.dim);
+                cv.text('This sends ~' + SWEEP_RANGES.reduce((s, r) => s + r[1] - r[0] + 1, 0) + ' read requests (service 22) across ' + SWEEP_RANGES.length + ' ranges.', 48, 200, 18, t.dim);
+                cv.text('Replies are logged to a file for matching against MHD.', 48, 230, 18, t.dim);
+                cv.text('Ranges: ' + SWEEP_RANGES.map((r) => r[2]).join(' · '), 48, 270, 16, withAlpha(t.dim, 0.6));
+                return;
+            }
+
+            // progress bar
+            const pct = sw.total ? Math.round(100 * sw.scanned / sw.total) : 0;
+            const sub = sw.done ? sw.hits.length + ' identifiers found · ' + sw.scanned + ' scanned · Refresh to re-sweep' : sw.step + '  ' + pct + '% (' + sw.scanned + '/' + sw.total + ')';
+            cv.text(sub, 1552, 86, 16, t.dim, { align: 'right' });
+            if (!sw.done) {
+                const bw = 500, bx = 1052, by = 68, bh = 8;
+                cv.roundRect(bx, by, bw, bh, 4, withAlpha(t.dim, 0.15));
+                if (pct > 0) cv.roundRect(bx, by, Math.max(8, bw * pct / 100), bh, 4, GO);
+            }
+
+            if (!sw.hits.length && !sw.done) {
+                cv.text('Scanning... no positive replies yet.', 48, 200, 22, t.dim);
+                return;
+            }
+            if (!sw.hits.length && sw.done) {
+                cv.text('No positive replies found in any range.', 48, 200, 22, ERR_COLOR);
+                return;
+            }
+
+            // column headers
+            cv.text('DID', 48, 108, 14, withAlpha(t.dim, 0.6), { font: 'num' });
+            cv.text('Range', 130, 108, 14, withAlpha(t.dim, 0.6));
+            cv.text('Len', 430, 108, 14, withAlpha(t.dim, 0.6));
+            cv.text('Data', 490, 108, 14, withAlpha(t.dim, 0.6), { font: 'num' });
+            cv.text('Ext?', 1100, 108, 14, withAlpha(t.dim, 0.6));
+            cv.text('Readiness?', 1250, 108, 14, withAlpha(t.dim, 0.6));
+
+            const hits = sw.hits, rh = 26, maxRows = Math.min(SWEEP_PER_PAGE, Math.floor((p.h - 90) / rh));
+            const pages = Math.ceil(hits.length / maxRows) || 1;
+            sweepPage = Math.min(sweepPage, pages - 1);
+            const shown = hits.slice(sweepPage * maxRows, (sweepPage + 1) * maxRows);
+
+            shown.forEach((h, i) => {
+                const y = 130 + i * rh;
+                cv.text(h.hex, 48, y, 16, GO, { font: 'num' });
+                cv.text(fitText(cv, h.range, 14, 280), 130, y, 14, t.dim);
+                cv.text(String(h.len), 430, y, 14, t.text, { font: 'num' });
+                cv.text(fitText(cv, h.raw, 14, 580, { font: 'num' }), 490, y, 14, withAlpha(t.text, 0.7), { font: 'num' });
+                if (h.needsExt !== undefined) cv.text(h.needsExt ? 'YES' : 'no', 1100, y, 14, h.needsExt ? '#e0a030' : t.dim);
+                // flag potential readiness: 4 data bytes in F4xx range, or any 4-byte result with monitor-like bit patterns
+                const maybe = (h.len === 4 && h.did >= 0xF400 && h.did <= 0xF4FF) || (h.len === 4 && h.data.length === 4 && (h.data[1] & 0x07) !== 0);
+                if (maybe) cv.text('likely', 1250, y, 14, '#e0a030', { font: 'bold' });
+            });
+
+            if (pages > 1) cv.text('Page ' + (sweepPage + 1) + ' of ' + pages, 1552, p.y + p.h - 18, 18, t.dim, { align: 'right' });
+        }
+
         let drawn = -1;
         async function render(force) {
             if (!force && drawn === version) return;
@@ -638,24 +808,27 @@ mgu.run({
             if (page === 0) { drawSummary(cv, t, v); drawMonitors(cv, t, v); drawAdvice(cv, t, v); }
             else if (page === 1) drawFaults(cv, t);
             else if (page === 2) drawPlan(cv, t, v);
-            else drawProbe(cv, t);
+            else if (page === 3) drawProbe(cv, t);
+            else drawSweep(cv, t);
             const reading = S.phase === 'connecting' || busy;
-            G.frame(cv, t, TABS, page, [S.demo && { text: 'DEMO' }, reading && { text: 'READING', color: 'accent2' }, probing && { text: 'PROBING', color: 'accent2' }]);
+            G.frame(cv, t, TABS, page, [S.demo && { text: 'DEMO' }, reading && { text: 'READING', color: 'accent2' }, probing && { text: 'PROBING', color: 'accent2' }, sweeping && { text: 'SWEEPING', color: 'accent2' }]);
             await ui.image('MAIN_GFX', cv);
         }
 
-        ui.onClick('BTN_REFRESH', () => { if (page === 3) { runProbe(); } else { forced = true; poll(); } changed(); });
+        ui.onClick('BTN_REFRESH', () => { if (page === 4) { runSweep(); } else if (page === 3) { runProbe(); } else { forced = true; poll(); } changed(); });
         ui.onClick('BTN_PAGE', () => {
             const pl = view().plan, pages = Math.ceil(pl.steps.length / PLAN_PER_PAGE);
             if (page === 2 && planPage + 1 < pages) planPage++;
-            else if (page === 3 && S.probe) { const pp = Math.ceil(S.probe.rows.length / PROBE_PER_PAGE) || 1; if (probePage + 1 < pp) { probePage++; changed(); return; } else { page = 0; probePage = 0; } }
-            else { page = (page + 1) % TABS.length; planPage = 0; probePage = 0; }
+            else if (page === 3 && S.probe) { const pp = Math.ceil(S.probe.rows.length / PROBE_PER_PAGE) || 1; if (probePage + 1 < pp) { probePage++; changed(); return; } else { page = (page + 1) % TABS.length; probePage = 0; } }
+            else if (page === 4 && S.sweep && S.sweep.hits.length) { const sp = Math.ceil(S.sweep.hits.length / SWEEP_PER_PAGE) || 1; if (sweepPage + 1 < sp) { sweepPage++; changed(); return; } else { page = 0; sweepPage = 0; } }
+            else { page = (page + 1) % TABS.length; planPage = 0; probePage = 0; sweepPage = 0; }
             changed();
         });
         ctx.onTab((i) => {
             if (i === page && i === 2) { const pages = Math.ceil(view().plan.steps.length / PLAN_PER_PAGE) || 1; planPage = (planPage + 1) % pages; }
             else if (i === page && i === 3 && S.probe) { const pp = Math.ceil(S.probe.rows.length / PROBE_PER_PAGE) || 1; probePage = (probePage + 1) % pp; }
-            else { page = i; planPage = 0; probePage = 0; if (i === 3 && !S.probe && !probing) runProbe(); }
+            else if (i === page && i === 4 && S.sweep && S.sweep.hits.length) { const sp = Math.ceil(S.sweep.hits.length / SWEEP_PER_PAGE) || 1; sweepPage = (sweepPage + 1) % sp; }
+            else { page = i; planPage = 0; probePage = 0; sweepPage = 0; if (i === 3 && !S.probe && !probing) runProbe(); }
             changed();
         });
         ctx.onLayout(changed);

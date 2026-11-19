@@ -98,6 +98,22 @@ test('a blocked request never reaches the transport', async () => {
     assert.strictEqual(link.stats.blocked, 2);
 });
 
+test('sweep only allows service 22 reads to known units', async () => {
+    const sent = [], link = await new ReadinessLink(fakeSignals(sent), quietLog, { gapMs: 1 }).init();
+    // known unit, valid DID: should reach transport
+    const r = await link.sweep(0x12, 0xF401);
+    assert.ok(sent.length === 1, 'sweep sent request');
+    assert.deepStrictEqual(sent[0], [0x12, 0x22, [0xF4, 0x01]], 'sweep sends service 22');
+    assert.ok(r && r[0] === 0x62, 'sweep got positive reply');
+    // unknown unit: rejected before transport
+    await assert.rejects(() => link.sweep(0x40, 0xF401), /not allowed/);
+    await assert.rejects(() => link.sweep(0xDF, 0xD000), /not allowed/);
+    // bad DID
+    await assert.rejects(() => link.sweep(0x12, -1), /bad DID/);
+    await assert.rejects(() => link.sweep(0x12, 0x10000), /bad DID/);
+    assert.strictEqual(sent.length, 1, 'rejected sweeps never reached transport');
+});
+
 /* ---------- decoding ---------- */
 test('PID 01 decoding, optional monitors left out', () => {
     // catalyst, evap, O2, O2 heater present; secondary air, heated cat, A/C, EGR absent; catalyst + O2 incomplete

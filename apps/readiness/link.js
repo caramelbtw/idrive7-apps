@@ -182,6 +182,34 @@ class ReadinessLink {
         return this.queue(run);
     }
 
+    /**
+     * DID sweep: read one arbitrary identifier (service 0x22) from a physical unit.
+     * Bypasses check() but ONLY allows service 0x22 — purely read-only, cannot modify anything.
+     * Uses a shorter timeout (sweepMs) for discovery since most DIDs won't reply.
+     * Returns the UDS reply bytes, or null (no answer).
+     */
+    sweep(target, did, opts) {
+        if (!byte(target) || !UNITS[target]) return Promise.reject(new Error('sweep: unit ' + hx(target) + ' not allowed'));
+        if (!Number.isInteger(did) || did < 0 || did > 0xFFFF) return Promise.reject(new Error('sweep: bad DID'));
+        const hi = (did >> 8) & 0xFF, lo = did & 0xFF;
+        const d = [hi, lo];
+        const sweepMs = (opts && opts.sweepMs) || 600;
+        const sweepGap = (opts && opts.sweepGap) || 80;
+        const run = async () => {
+            const wait = Math.max(0, this.next - Date.now());
+            if (wait) await sleep(wait);
+            try {
+                this.stats.sent++;
+                const uds = await LINKS.get(this).physical(target, 0x22, d, sweepMs, accepts(0x22, d));
+                if (!uds) { this.stats.missed++; return null; }
+                this.stats.replies++;
+                if (uds[0] === 0x7F && uds[2] === 0x21) this.next = Math.max(this.next, Date.now() + 1000);
+                return uds;
+            } finally { this.next = Math.max(this.next, Date.now() + sweepGap); }
+        };
+        return this.queue(run);
+    }
+
     queue(run) {
         const p = this.chain.then(run, run);
         this.chain = p.catch(() => {});
