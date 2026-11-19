@@ -151,9 +151,10 @@ mgu.run({
         /* ---------- strobe controls ---------- */
         async function startStrobe() {
             var pat = S.PATTERNS[selectedPattern];
-            if (!pat) return;
-            // update sequencer link in case demo mode changed
-            sequencer.link = link();
+            if (!pat || !bdcOk) return;
+            var L = link();
+            sequencer.link = L;
+            await L.ask(0x40, 0x10, [0x03]);
             await sequencer.start(pat, strobeSpeed);
             changed();
         }
@@ -161,6 +162,7 @@ mgu.run({
         async function stopStrobe() {
             await sequencer.stop();
             activeOnIds = [];
+            try { await link().ask(0x40, 0x10, [0x01]); } catch (e) {}
             changed();
         }
 
@@ -215,7 +217,8 @@ mgu.run({
             var cx = 600, cy = 142;
 
             var btnW = 200, btnH = 44;
-            var btnColor = sequencer.running ? t.crit : (t.accent2 || t.accent);
+            var canPlay = bdcOk && phase === 'ready';
+            var btnColor = sequencer.running ? t.crit : canPlay ? (t.accent2 || t.accent) : withAlpha(t.dim, 0.3);
             cv.roundRect(cx, cy, btnW, btnH, 8, btnColor);
             var btnLabel = sequencer.running ? 'STOP' : 'PLAY';
             cv.text(btnLabel, cx + btnW / 2, cy + 30, 20, '#FFFFFF', { align: 'center', font: 'bold' });
