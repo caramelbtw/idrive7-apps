@@ -38,6 +38,8 @@ mgu.run({
         var page = 0, version = 0;
         var blocks = {};           // 'ecu:did' -> byte[]
         var phase = 'idle';        // idle | reading | ready | error
+        var bdcOk = false;         // BDC reachable (strobe can work)
+        var flmOk = false;         // FLM reachable (DRL coding works)
         var statusMsg = '';
         var statusAt = 0;
         var writing = false;
@@ -56,8 +58,8 @@ mgu.run({
         const changed = function () { version++; if (loop) loop.kick(); };
         const status = function (msg) { statusMsg = msg; statusAt = Date.now(); changed(); };
 
-        /* ---------- DRL reads ---------- */
-        async function readDrl() {
+        /* ---------- probe + read ---------- */
+        async function probeAndRead() {
             if (phase === 'reading') return;
             phase = 'reading'; changed();
             var linked = await ensureLink();
@@ -71,46 +73,39 @@ mgu.run({
                 return;
             }
 
-            // probe which ECUs are reachable via TASU
-            var reached = [];
-            var probes = [0x40, C.ECU.FLM_L, C.ECU.FLM_R];
-            for (var p = 0; p < probes.length; p++) {
+            // probe BDC
+            if (!bdcOk) {
                 try {
-                    var id = await L.identify(probes[p]);
-                    if (id) reached.push(probes[p].toString(16));
+                    var bdcId = await L.identify(0x40);
+                    bdcOk = !!bdcId;
+                    if (bdcOk) log.info('BDC reached: ' + bdcId);
                 } catch (e) {}
             }
-            log.info('TASU probe: reached [' + reached.join(', ') + ']');
 
-            // enter extended session on FLM before reading coding data
+            // probe + read FLM
             var ecus = [C.ECU.FLM_L, C.ECU.FLM_R];
-            for (var s = 0; s < ecus.length; s++) {
-                try { await L.ask(ecus[s], 0x10, [0x03]); } catch (e) {}
-            }
-
             var ok = 0;
             for (var i = 0; i < ecus.length; i++) {
                 var ecu = ecus[i];
                 try {
+                    await L.ask(ecu, 0x10, [0x03]);
                     var block = await L.readDid(ecu, '3100');
-                    if (block) {
-                        blocks[ecu + ':3100'] = block;
-                        ok++;
-                    }
+                    if (block) { blocks[ecu + ':3100'] = block; ok++; }
+                    await L.ask(ecu, 0x10, [0x01]);
                 } catch (e) {
-                    log.warn('FLM read ' + ecu.toString(16) + ': ' + e);
+                    log.warn('FLM ' + ecu.toString(16) + ': ' + e);
                 }
             }
+            flmOk = ok > 0;
 
-            // return to default session
-            for (var d = 0; d < ecus.length; d++) {
-                try { await L.ask(ecus[d], 0x10, [0x01]); } catch (e) {}
+            if (bdcOk || flmOk) {
+                phase = 'ready';
+            } else {
+                phase = 'error';
+                statusMsg = 'No ECU reachable'; statusAt = Date.now();
             }
-
-            phase = ok > 0 ? 'ready' : 'error';
-            if (!ok) {
-                statusMsg = reached.length ? 'BDC ok, FLM no answer' : 'No ECU reachable via TASU';
-                statusAt = Date.now();
+            if (bdcOk && !flmOk) {
+                statusMsg = 'FLM not routable via TASU'; statusAt = Date.now();
             }
             lastRead = Date.now();
             changed();
@@ -119,8 +114,8 @@ mgu.run({
         async function poll() {
             if (!ui.isVisible('MAIN')) return;
             if (phase === 'reading') return;
-            if (phase === 'idle' || phase === 'error' || Date.now() - lastRead > 30000) {
-                await readDrl();
+            if (phase === 'idle' || (phase === 'error' && Date.now() - lastRead > 8000) || Date.now() - lastRead > 30000) {
+                await probeAndRead();
             }
         }
         setInterval(poll, 4000);
@@ -176,8 +171,17 @@ mgu.run({
             var title = page === 0 ? 'LIGHT SHOW' : 'DRL CONTROL';
             cv.text(title, 48, 80, 24, t.text, { font: 'bold', spacing: 2 });
 
-            var conn = phase === 'ready' ? 'CONNECTED' : phase === 'reading' ? 'READING...' : phase === 'error' ? 'NO LINK' : 'CONNECTING...';
-            var connColor = phase === 'ready' ? '#2fd27a' : phase === 'error' ? t.crit : t.dim;
+            var conn, connColor;
+            if (phase === 'reading' || phase === 'idle') {
+                conn = phase === 'reading' ? 'READING...' : 'CONNECTING...';
+                connColor = t.dim;
+            } else if (page === 0) {
+                conn = bdcOk ? 'BDC CONNECTED' : 'NO LINK';
+                connColor = bdcOk ? '#2fd27a' : t.crit;
+            } else {
+                conn = flmOk ? 'FLM CONNECTED' : bdcOk ? 'FLM UNAVAILABLE' : 'NO LINK';
+                connColor = flmOk ? '#2fd27a' : t.crit;
+            }
             cv.text(conn, 1552, 80, 15, connColor, { align: 'right', font: 'bold', spacing: 1 });
         }
 
@@ -296,18 +300,26 @@ mgu.run({
 
         function drawDrlPage(cv, t) {
             drlTapTargets = [];
-            var opt = C.OPTIONS[0];
-            var key = C.ECU.FLM_L + ':3100';
-            var block = blocks[key];
-            var raw = block ? C.readBits(block, opt) : null;
-            var curLabel = raw !== null ? C.label(opt, raw) : '--';
             var accent = t.accent2 || t.accent;
-
             var cx = 800;
             var baseY = 140;
 
             cv.text('DRL BRIGHTNESS', cx, baseY, 20, t.text, { align: 'center', font: 'bold', spacing: 2 });
             cv.text('Daytime running light LED intensity', cx, baseY + 24, 13, t.dim, { align: 'center' });
+
+            if (!flmOk && phase !== 'reading' && phase !== 'idle') {
+                cv.text('FLM modules not reachable', cx, baseY + 90, 20, t.crit, { align: 'center', font: 'bold' });
+                cv.text('TASU on BDC2 cannot route to FLM 0x43 / 0x44', cx, baseY + 116, 13, t.dim, { align: 'center' });
+                cv.text('DRL coding requires direct diagnostic access to the headlight modules.', cx, baseY + 140, 12, withAlpha(t.dim, 0.6), { align: 'center' });
+                cv.text('Use ISTA or BimmerCode for DRL brightness on this vehicle.', cx, baseY + 160, 12, withAlpha(t.dim, 0.6), { align: 'center' });
+                return;
+            }
+
+            var opt = C.OPTIONS[0];
+            var key = C.ECU.FLM_L + ':3100';
+            var block = blocks[key];
+            var raw = block ? C.readBits(block, opt) : null;
+            var curLabel = raw !== null ? C.label(opt, raw) : '--';
 
             // large readout
             cv.text(curLabel, cx, baseY + 100, 44, accent, { align: 'center', font: 'bold' });
@@ -413,6 +425,8 @@ mgu.run({
 
         ui.onClick('BTN_REFRESH', function () {
             phase = 'idle';
+            bdcOk = false;
+            flmOk = false;
             blocks = {};
             linkInited = false;
             diagLink.wake();
