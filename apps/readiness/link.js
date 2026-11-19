@@ -17,6 +17,10 @@
  *   22 F1 50     the unit's SGBD index (which engine / gearbox type it is: picks its fault texts).
  *   22 F4 <PID>  the same OBD-II data as 01 <PID>, as a UDS identifier (ISO 27145): what most BMW engine units
  *                answer over the head unit's link (01 is often refused with NRC 11). Same PIDs as 01 only.
+ *   10 03        DiagnosticSessionControl - ExtendedDiagnosticSession: some engine units expose the F4xx DIDs (or
+ *                answer 01) only after entering extended session. No data is modified; the session reverts after S3
+ *                timeout (~5 s of inactivity). Only sub-function 03 is allowed; default (01) and programming (02)
+ *                are not.
  *
  * Physically only to the units in UNITS (engine unit, second engine unit, gearbox). To all units at once (functional,
  * 0xDF: how an OBD-II scan tool asks) only 01 <PID> and 22 F4 <PID> with the PIDs above, for engine units that don't
@@ -65,13 +69,17 @@ function check(target, sid, data) {
         if (!ok) throw new Error('read-only: 22 ' + data.map(hx).join(' ') + ' is not allowed (only 22 F1 50 and 22 F4 <PID>)');
         return;
     }
+    if (sid === 0x10) {
+        if (data.length !== 1 || data[0] !== 0x03) throw new Error('read-only: 10 ' + data.map(hx).join(' ') + ' is not allowed (only 10 03 extended session)');
+        return;
+    }
     throw new Error('read-only: service ' + hx(sid) + ' is not allowed');
 }
 
 /** the reply to this request (every app gets every frame from a unit): positive echo, or a refusal of this service */
 function accepts(sid, data) {
     // 01 echoes its PID, 19 its sub-function, 22 its identifier
-    const echo = sid === 0x22 ? 2 : sid === 0x01 || sid === 0x19 ? 1 : 0;
+    const echo = sid === 0x22 ? 2 : sid === 0x01 || sid === 0x10 || sid === 0x19 ? 1 : 0;
     return (u) => (u[0] === sid + 0x40 && data.slice(0, echo).every((b, i) => u[i + 1] === b)) || (u[0] === 0x7F && u[1] === sid);
 }
 
@@ -103,6 +111,14 @@ class ReadinessLink {
     get failed() { return LINKS.get(this).error; }
     silent(target) { return (this.misses[target] || 0) >= this.silentAfter; }
     wake(target) { if (target === undefined) this.misses = {}; else delete this.misses[target]; }
+
+    /** Enter extended diagnostic session (10 03) on one ECU: true if accepted, false if refused or no answer. */
+    async session(target) {
+        try {
+            const r = await this.ask(target, 0x10, [0x03]);
+            return !!(r && r[0] === 0x50);
+        } catch (e) { return false; }
+    }
 
     /** One allowed request: the unit's reply bytes (41 .. / 43 .. / 7F ..), or null (no answer / skipped). */
     ask(target, sid, data) {

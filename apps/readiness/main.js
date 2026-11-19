@@ -19,8 +19,9 @@
  * not counted.
  *
  * READ ONLY by construction: every request goes through link.js, which refuses anything but OBD-II 01 (a fixed list
- * of PIDs), 03, 07 and 0A, UDS 19 02 (read fault memory), 22 F1 50 (unit type) and 22 F4 <PID> (the PIDs of 01 as UDS
- * identifiers: how BMW engine units answer them), to the engine unit(s) and gearbox. No clear, no session change, no write, no routine, no
+ * of PIDs), 03, 07 and 0A, UDS 19 02 (read fault memory), 22 F1 50 (unit type), 22 F4 <PID> (the PIDs of 01 as UDS
+ * identifiers: how BMW engine units answer them) and 10 03 (extended diagnostic session, for units that lock the F4xx
+ * DIDs behind it), to the engine unit(s) and gearbox. No clear, no write, no routine, no
  * actuation, and no car signal is set. It asks only while its screen is shown: readiness every 10 s, the rest every
  * 30 s, and everything again on Refresh. Nothing is stored on disk.
  */
@@ -94,10 +95,11 @@ mgu.run({
          * on their own, only when every unit is asked at once as an OBD-II scan tool does ('all-obd' / 'all-uds', for
          * the engine unit only). 'via' fixes the one that answered; until then each is tried in turn.
          */
-        const VIAS = { 0x12: ['uds', 'obd', 'all-obd', 'all-uds'] };
+        const VIAS = { 0x12: ['uds', 'obd', 'all-obd', 'all-uds', 'ext-uds', 'ext-obd'] };
         async function pid(addr, p, via) {
             for (const v of via ? [via] : VIAS[addr] || ['uds', 'obd']) {
-                const uds = v === 'uds' || v === 'all-uds', sid = uds ? 0x22 : 0x01, req = uds ? [0xF4, p] : [p];
+                if (v.startsWith('ext-')) await link.session(addr);
+                const uds = v === 'uds' || v === 'all-uds' || v === 'ext-uds', sid = uds ? 0x22 : 0x01, req = uds ? [0xF4, p] : [p];
                 let u;
                 if (v.startsWith('all-')) {
                     const m = await askAll(sid, req, addr);
@@ -106,7 +108,8 @@ mgu.run({
                 } else u = await ask(addr, sid, req);
                 if (uds && u && u[0] === 0x62 && u[1] === 0xF4 && u[2] === p) return { via: v, data: u.slice(3) };
                 if (!uds && u && u[0] === 0x41 && u[1] === p) return { via: v, data: u.slice(2) };
-                note(addr, (v.startsWith('all-') ? 'all ' : '') + (uds ? '22 F4' + h2(p) : '01 ' + h2(p)), u);
+                const prefix = v.startsWith('all-') ? 'all ' : v.startsWith('ext-') ? 'ext ' : '';
+                note(addr, prefix + (uds ? '22 F4' + h2(p) : '01 ' + h2(p)), u);
                 if (!u && addr !== 0x12) break;            // silence from a second engine unit: there is none (no 2 s more)
             }
             return null;

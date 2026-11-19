@@ -30,11 +30,13 @@ test('guard allows only the listed reads', () => {
     [[0x12, 0x01, [0x01]], [0x12, 0x01, [0x41]], [0x13, 0x01, [0x00]], [0x12, 0x01, [0x4E]],
         [0x12, 0x03, []], [0x12, 0x07, []], [0x18, 0x0A, []],
         [0x12, 0x19, [0x02, 0x0C]], [0x18, 0x19, [0x02, 0xFF]], [0x12, 0x22, [0xF1, 0x50]],
-        [0x12, 0x22, [0xF4, 0x01]], [0x13, 0x22, [0xF4, 0x41]], [0x12, 0x22, [0xF4, 0x00]]].forEach(([a, s, d]) => check(a, s, d));
+        [0x12, 0x22, [0xF4, 0x01]], [0x13, 0x22, [0xF4, 0x41]], [0x12, 0x22, [0xF4, 0x00]],
+        [0x12, 0x10, [0x03]]].forEach(([a, s, d]) => check(a, s, d));
     const bad = [
         [0x12, 0x04, []],                 // OBD clear faults
         [0x12, 0x14, [0xFF, 0xFF, 0xFF]], // UDS clear DTCs
-        [0x12, 0x10, [0x03]],             // session
+        [0x12, 0x10, [0x01]],             // session: only 10 03 allowed
+        [0x12, 0x10, [0x02]],             // session: programming not allowed
         [0x12, 0x11, [0x01]],             // reset
         [0x12, 0x2E, [0xF1, 0x90, 0]],    // write
         [0x12, 0x2F, [0x60, 0xFD, 0x03]], // actuate
@@ -222,7 +224,7 @@ test('app on a real (fake) link sends only allowed reads, and draws every page',
     await new Promise((r) => setTimeout(r, 5000));         // the first polls (the absent second engine unit takes 2 s)
     assert.ok(sent.length > 5, 'asked the car: ' + sent.length);
     sent.forEach(([a, s, d]) => check(a, s, d));
-    assert.ok(sent.every(([, s]) => [0x01, 0x03, 0x07, 0x0A, 0x19, 0x22].indexOf(s) >= 0));
+    assert.ok(sent.every(([, s]) => [0x01, 0x03, 0x07, 0x0A, 0x10, 0x19, 0x22].indexOf(s) >= 0));
     assert.ok(sent.some(([a, s, d]) => a === 0x12 && s === 0x19 && d[0] === 0x02), 'read BMW fault memory');
     assert.ok(sent.some(([a, s]) => a === 0x12 && s === 0x22), 'identified the engine unit');
     assert.ok(sent.some(([, s]) => s === 0x07), 'read pending OBD faults');
@@ -257,7 +259,7 @@ test('an engine unit that answers only service 01 still gives readiness', async 
 test('no readiness answer: faults are still read, and the refusal is shown', async () => {
     const none = (a, s, d) => (s === 0x01 || (s === 0x22 && d[0] === 0xF4) ? (a === 0x12 ? [0x7F, s, 0x11] : null) : DEMO.reply(a, s, d));
     const sent = [], app = await runApp('off', sent, none);
-    await new Promise((r) => setTimeout(r, 10000));        // every way is tried (to all units too) before giving up
+    await new Promise((r) => setTimeout(r, 18000));        // every way is tried (incl. ext-* with session timeouts) before giving up
     sent.forEach(([a, s, d]) => check(a, s, d));
     assert.ok(sent.some(([a, s, d]) => a === 0x12 && s === 0x19 && d[0] === 0x02), 'read BMW fault memory without readiness');
     await app.shot('no-answer');
@@ -283,6 +285,28 @@ test('an engine unit silent to readiness asked on its own still gives it when ev
     assert.ok(sent.some(([a, s, d]) => a === 0x12 && s === 0x19 && d[0] === 0x02), 'fault memory still read after the silent tries');
     await app.shot('x');
     assert.ok(/monitors complete/.test(app.texts()), 'readiness shown: ' + app.texts());
+});
+
+test('an engine unit that needs extended session (10 03) gives readiness after it', async () => {
+    // F4xx refused with NRC 31, service 01 no reply, until 10 03 is sent; then F4xx works
+    let inSession = false;
+    const needsExt = (a, s, d) => {
+        if (a === 0x12 && s === 0x10 && d[0] === 0x03) { inSession = true; return [0x50, 0x03, 0x00, 0x19]; }
+        if (s === 0x22 && d[0] === 0xF4) {
+            if (!inSession) return [0x7F, 0x22, 0x31];
+            return DEMO.reply(a, s, d);
+        }
+        if (s === 0x01 && a === 0x12) return null;
+        if (a === 0xDF) return null;
+        return DEMO.reply(a, s, d);
+    };
+    const sent = [], app = await runApp('off', sent, needsExt);
+    await new Promise((r) => setTimeout(r, 18000));
+    sent.forEach(([a, s, d]) => check(a, s, d));
+    assert.ok(sent.some(([a, s, d]) => a === 0x12 && s === 0x10 && d[0] === 0x03), 'entered extended session');
+    assert.ok(sent.some(([a, s, d]) => a === 0x12 && s === 0x22 && d[0] === 0xF4 && d[1] === 0x01), 'readiness by 22 F4 01');
+    await app.shot('ext-session');
+    assert.ok(/monitors complete/.test(app.texts()), 'readiness shown after extended session: ' + app.texts());
 });
 
 test('the guard lets only readiness reads go to all units', async () => {
