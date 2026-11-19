@@ -39,8 +39,9 @@ const GO = '#2fd27a';
 const ENGINES = [0x12, 0x13];
 const READ_MS = 10000, SLOW_MS = 30000;
 const BMW_MASK = 0x0C;            // 19 02 status mask: pending and confirmed (stored) faults, as Fault Scanner's "Current"
-const TABS = ['Readiness', 'Faults', 'Drive plan'];
+const TABS = ['Readiness', 'Faults', 'Drive plan', 'Probe'];
 const PLAN_PER_PAGE = 4;
+const PROBE_PER_PAGE = 14;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -66,9 +67,10 @@ mgu.run({
                 types: {},                 // address -> unit type (DME8FF_R ...) or '' (22 F1 50 once; picks BMW texts)
                 faults: null,              // [{ code, text, system, systemName, unit, label, sev, bmw }] (see readFaults)
                 readAt: 0, slowAt: 0, error: '',
+                probe: null,               // { rows: [{ section, label, req, resp, detail }], step, done }
             };
         }
-        let page = 0, planPage = 0, version = 0, busy = false, forced = false;
+        let page = 0, planPage = 0, probePage = 0, version = 0, busy = false, forced = false, probing = false;
         const changed = () => { version++; if (loop) loop.kick(); };
 
         /** one request: the demo car's reply or the real unit's (null: no answer) */
@@ -233,7 +235,7 @@ mgu.run({
 
         /** one pass: whatever is due (all of it after Refresh) */
         async function poll() {
-            if (busy || !ui.isVisible('MAIN')) return;
+            if (busy || probing || !ui.isVisible('MAIN')) return;
             busy = true;
             try {
                 const demo = useDemo();
@@ -475,6 +477,107 @@ mgu.run({
             if (pages > 1) cv.text('Page ' + (planPage + 1) + ' of ' + pages + ' · Next page for more', 1552, p.y + p.h - 18, 18, t.dim, { align: 'right' });
         }
 
+        /* ---------- diagnostic probe ---------- */
+        async function runProbe() {
+            if (probing) return;
+            probing = true;
+            link.wake();
+            const p = { rows: [], step: 'Starting...', done: false };
+            S.probe = p;
+            changed();
+
+            const hxr = (u, max) => u ? u.slice(0, max || 10).map((b) => h2(b)).join(' ') + (u.length > (max || 10) ? ' ..' : '') : '--';
+            const interp = (u) => !u ? 'no reply' : u[0] === 0x7F ? NRC[u[2]] || 'NRC ' + h2(u[2]) : null;
+            const pos = (u) => u && u[0] !== 0x7F;
+            const add = (section, label, req, resp, detail) => { p.rows.push({ section, label, req, resp, detail }); changed(); };
+
+            try {
+                // functional broadcasts: who answers OBD and UDS?
+                p.step = 'Broadcasting OBD...'; changed();
+                const fObd = await askAll(0x01, [0x00]);
+                p.step = 'Broadcasting UDS...'; changed();
+                const fUds = await askAll(0x22, [0xF4, 0x00]);
+                add(true, 'FUNCTIONAL BROADCAST', '', '', '');
+                const oa = [...fObd.keys()].filter((a) => pos(fObd.get(a))).map((a) => '0x' + h2(a));
+                const on = [...fObd.keys()].filter((a) => !pos(fObd.get(a))).map((a) => '0x' + h2(a) + ' (' + interp(fObd.get(a)) + ')');
+                add(false, 'OBD 01 00 to all', '', '', oa.length ? 'positive: ' + oa.join(', ') + (on.length ? ' · refused: ' + on.join(', ') : '') : on.length ? 'refused: ' + on.join(', ') : 'no replies');
+                const ua = [...fUds.keys()].filter((a) => pos(fUds.get(a))).map((a) => '0x' + h2(a));
+                const un = [...fUds.keys()].filter((a) => !pos(fUds.get(a))).map((a) => '0x' + h2(a) + ' (' + interp(fUds.get(a)) + ')');
+                add(false, 'UDS 22 F400 to all', '', '', ua.length ? 'positive: ' + ua.join(', ') + (un.length ? ' · refused: ' + un.join(', ') : '') : un.length ? 'refused: ' + un.join(', ') : 'no replies');
+
+                // per unit: identify, then detailed probes
+                for (const addr of [0x12, 0x13, 0x18]) {
+                    const name = UNITS[addr];
+                    p.step = name + '...'; changed();
+
+                    const ident = await ask(addr, 0x22, [0xF1, 0x50]);
+                    if (!ident) { add(true, name + ' (0x' + h2(addr) + ')', '', '', 'not present'); continue; }
+                    const idx = ident[0] === 0x62 && ident.length >= 6 ? ((ident[3] << 16) | (ident[4] << 8) | ident[5]).toString(16).toUpperCase().padStart(6, '0') : '';
+                    const type = BMW.variant(addr, idx) || '';
+                    add(true, name + ' (0x' + h2(addr) + ')', '', '', type || idx || 'answered');
+
+                    add(false, 'Identify', '22 F1 50', hxr(ident), type ? type + ' (' + idx + ')' : interp(ident) || hxr(ident));
+
+                    const sess = await ask(addr, 0x10, [0x03]);
+                    add(false, 'Ext session', '10 03', hxr(sess), sess && sess[0] === 0x50 ? 'accepted' : interp(sess) || 'no reply');
+
+                    const f4 = await ask(addr, 0x22, [0xF4, 0x01]);
+                    add(false, 'UDS readiness', '22 F4 01', hxr(f4), pos(f4) ? (f4.length - 3) + ' data bytes' : interp(f4) || 'no reply');
+
+                    if (sess && sess[0] === 0x50 && !pos(f4)) {
+                        await link.session(addr);
+                        const f4e = await ask(addr, 0x22, [0xF4, 0x01]);
+                        add(false, 'UDS after ext', '22 F4 01', hxr(f4e), pos(f4e) ? (f4e.length - 3) + ' data bytes' : interp(f4e) || 'no reply');
+                    }
+
+                    const obd = await ask(addr, 0x01, [0x01]);
+                    add(false, 'OBD readiness', '01 01', hxr(obd), pos(obd) ? (obd.length - 2) + ' data bytes' : interp(obd) || 'no reply');
+
+                    const faults = await ask(addr, 0x19, [0x02, BMW_MASK]);
+                    const nd = faults && faults[0] === 0x59 ? Math.floor((faults.length - 3) / 4) : null;
+                    add(false, 'Fault memory', '19 02', hxr(faults), nd !== null ? nd + ' DTCs' : interp(faults) || 'no reply');
+                }
+            } catch (e) { log.warn('probe: ' + e); }
+
+            p.step = '';
+            p.done = true;
+            probing = false;
+            changed();
+        }
+
+        function drawProbe(cv, t) {
+            const p = G.panel(cv, t, 24, 44, 1552, 468, 'Diagnostic Probe');
+            const sub = S.probe ? (S.probe.done ? 'Complete · Refresh to re-scan' : S.probe.step || 'Scanning...') : 'Press Refresh to scan';
+            cv.text(sub, 1552, 86, 18, t.dim, { align: 'right' });
+
+            if (!S.probe || !S.probe.rows.length) {
+                cv.text(S.probe ? 'Scanning the diagnostic bus...' : 'Navigate here and press Refresh to probe the diagnostic bus.', 48, 200, 24, t.dim);
+                return;
+            }
+
+            const rows = S.probe.rows, rh = 28, maxRows = Math.min(PROBE_PER_PAGE, Math.floor((p.h - 70) / rh));
+            const pages = Math.ceil(rows.length / maxRows) || 1;
+            probePage = Math.min(probePage, pages - 1);
+            const shown = rows.slice(probePage * maxRows, (probePage + 1) * maxRows);
+
+            shown.forEach((r, i) => {
+                const y = 118 + i * rh;
+                if (r.section) {
+                    cv.text(r.label, 48, y, 20, t.text, { font: 'bold' });
+                    if (r.detail) cv.text(fitText(cv, r.detail, 18, 500), 1552, y, 18, r.detail === 'not present' ? t.dim : t.text, { align: 'right' });
+                } else {
+                    cv.text(r.label, 72, y, 18, t.dim);
+                    cv.text(r.req, 260, y, 16, withAlpha(t.text, 0.5), { font: 'num' });
+                    cv.text(fitText(cv, r.resp, 16, 400, { font: 'num' }), 430, y, 16, withAlpha(t.text, 0.6), { font: 'num' });
+                    const good = /data bytes|accepted|positive|DTCs/.test(r.detail);
+                    const bad = r.detail === 'no reply' || /refused|no replies/.test(r.detail);
+                    cv.text(fitText(cv, r.detail, 18, 440), 1100, y, 18, good ? GO : bad ? t.dim : t.text);
+                }
+            });
+
+            if (pages > 1) cv.text('Page ' + (probePage + 1) + ' of ' + pages, 1552, p.y + p.h - 18, 18, t.dim, { align: 'right' });
+        }
+
         let drawn = -1;
         async function render(force) {
             if (!force && drawn === version) return;
@@ -482,20 +585,27 @@ mgu.run({
             const t = ctx.theme(), cv = ctx.canvas(W, H).clear(t.bg), v = view();
             if (page === 0) { drawSummary(cv, t, v); drawMonitors(cv, t, v); drawAdvice(cv, t, v); }
             else if (page === 1) drawFaults(cv, t);
-            else drawPlan(cv, t, v);
+            else if (page === 2) drawPlan(cv, t, v);
+            else drawProbe(cv, t);
             const reading = S.phase === 'connecting' || busy;
-            G.frame(cv, t, TABS, page, [S.demo && { text: 'DEMO' }, reading && { text: 'READING', color: 'accent2' }]);
+            G.frame(cv, t, TABS, page, [S.demo && { text: 'DEMO' }, reading && { text: 'READING', color: 'accent2' }, probing && { text: 'PROBING', color: 'accent2' }]);
             await ui.image('MAIN_GFX', cv);
         }
 
-        ui.onClick('BTN_REFRESH', () => { forced = true; poll(); changed(); });
+        ui.onClick('BTN_REFRESH', () => { if (page === 3) { runProbe(); } else { forced = true; poll(); } changed(); });
         ui.onClick('BTN_PAGE', () => {
             const pl = view().plan, pages = Math.ceil(pl.steps.length / PLAN_PER_PAGE);
             if (page === 2 && planPage + 1 < pages) planPage++;
-            else { page = (page + 1) % TABS.length; planPage = 0; }
+            else if (page === 3 && S.probe) { const pp = Math.ceil(S.probe.rows.length / PROBE_PER_PAGE) || 1; if (probePage + 1 < pp) { probePage++; changed(); return; } else { page = 0; probePage = 0; } }
+            else { page = (page + 1) % TABS.length; planPage = 0; probePage = 0; }
             changed();
         });
-        ctx.onTab((i) => { if (i === page && i === 2) { const pages = Math.ceil(view().plan.steps.length / PLAN_PER_PAGE) || 1; planPage = (planPage + 1) % pages; } else { page = i; planPage = 0; } changed(); });
+        ctx.onTab((i) => {
+            if (i === page && i === 2) { const pages = Math.ceil(view().plan.steps.length / PLAN_PER_PAGE) || 1; planPage = (planPage + 1) % pages; }
+            else if (i === page && i === 3 && S.probe) { const pp = Math.ceil(S.probe.rows.length / PROBE_PER_PAGE) || 1; probePage = (probePage + 1) % pp; }
+            else { page = i; planPage = 0; probePage = 0; if (i === 3 && !S.probe && !probing) runProbe(); }
+            changed();
+        });
         ctx.onLayout(changed);
         settings.onChange(() => changed());
         // every 5 s: redraw the "updated ... ago" text
