@@ -478,6 +478,9 @@ mgu.run({
         }
 
         /* ---------- diagnostic probe ---------- */
+        const PROBE_PIDS = [0x00, 0x01, 0x20, 0x30, 0x31, 0x40, 0x41, 0x4E];
+        const PID_NAMES = { 0x00: 'Supported 00-1F', 0x01: 'Monitor status', 0x20: 'Supported 20-3F', 0x30: 'Warm-ups', 0x31: 'Distance', 0x40: 'Supported 40-5F', 0x41: 'This drive', 0x4E: 'Time since clear' };
+
         async function runProbe() {
             if (probing) return;
             probing = true;
@@ -486,56 +489,96 @@ mgu.run({
             S.probe = p;
             changed();
 
-            const hxr = (u, max) => u ? u.slice(0, max || 10).map((b) => h2(b)).join(' ') + (u.length > (max || 10) ? ' ..' : '') : '--';
-            const interp = (u) => !u ? 'no reply' : u[0] === 0x7F ? NRC[u[2]] || 'NRC ' + h2(u[2]) : null;
+            const hxr = (u, max) => u ? u.slice(0, max || 12).map((b) => h2(b)).join(' ') + (u.length > (max || 12) ? ' ..' : '') : '--';
+            const nrc = (u) => !u ? null : u[0] === 0x7F ? (NRC[u[2]] || 'NRC ' + h2(u[2])) : null;
             const pos = (u) => u && u[0] !== 0x7F;
-            const add = (section, label, req, resp, detail) => { p.rows.push({ section, label, req, resp, detail }); changed(); };
+            const add = (section, label, req, detail, err) => { p.rows.push({ section, label, req, detail, err: err || '' }); changed(); };
 
             try {
-                // functional broadcasts: who answers OBD and UDS?
+                // functional broadcasts
                 p.step = 'Broadcasting OBD...'; changed();
                 const fObd = await askAll(0x01, [0x00]);
                 p.step = 'Broadcasting UDS...'; changed();
                 const fUds = await askAll(0x22, [0xF4, 0x00]);
                 add(true, 'FUNCTIONAL BROADCAST', '', '', '');
-                const oa = [...fObd.keys()].filter((a) => pos(fObd.get(a))).map((a) => '0x' + h2(a));
-                const on = [...fObd.keys()].filter((a) => !pos(fObd.get(a))).map((a) => '0x' + h2(a) + ' (' + interp(fObd.get(a)) + ')');
-                add(false, 'OBD 01 00 to all', '', '', oa.length ? 'positive: ' + oa.join(', ') + (on.length ? ' · refused: ' + on.join(', ') : '') : on.length ? 'refused: ' + on.join(', ') : 'no replies');
-                const ua = [...fUds.keys()].filter((a) => pos(fUds.get(a))).map((a) => '0x' + h2(a));
-                const un = [...fUds.keys()].filter((a) => !pos(fUds.get(a))).map((a) => '0x' + h2(a) + ' (' + interp(fUds.get(a)) + ')');
-                add(false, 'UDS 22 F400 to all', '', '', ua.length ? 'positive: ' + ua.join(', ') + (un.length ? ' · refused: ' + un.join(', ') : '') : un.length ? 'refused: ' + un.join(', ') : 'no replies');
+                const fmtMap = (m) => {
+                    const ok = [...m.keys()].filter((a) => pos(m.get(a)));
+                    const bad = [...m.keys()].filter((a) => !pos(m.get(a)));
+                    return { ok, bad, detail: ok.length ? ok.map((a) => '0x' + h2(a)).join(' ') + ' answered' : 'no replies',
+                        err: bad.length ? bad.map((a) => '0x' + h2(a) + ': ' + (nrc(m.get(a)) || '?')).join(', ') : '' };
+                };
+                const ob = fmtMap(fObd), ub = fmtMap(fUds);
+                add(false, 'OBD 01 00 to all', '01 00', ob.detail, ob.err);
+                add(false, 'UDS 22 F400 to all', '22 F4 00', ub.detail, ub.err);
 
-                // per unit: identify, then detailed probes
+                // per unit: deep probe
                 for (const addr of [0x12, 0x13, 0x18]) {
                     const name = UNITS[addr];
                     p.step = name + '...'; changed();
 
+                    // identify
                     const ident = await ask(addr, 0x22, [0xF1, 0x50]);
-                    if (!ident) { add(true, name + ' (0x' + h2(addr) + ')', '', '', 'not present'); continue; }
+                    if (!ident) { add(true, name + ' (0x' + h2(addr) + ')', '', 'not present — no reply', ''); continue; }
                     const idx = ident[0] === 0x62 && ident.length >= 6 ? ((ident[3] << 16) | (ident[4] << 8) | ident[5]).toString(16).toUpperCase().padStart(6, '0') : '';
                     const type = BMW.variant(addr, idx) || '';
-                    add(true, name + ' (0x' + h2(addr) + ')', '', '', type || idx || 'answered');
+                    const heading = type ? type + ' (' + idx + ')' : idx || 'present';
+                    add(true, name + ' (0x' + h2(addr) + ')', '', heading, nrc(ident) || '');
+                    add(false, 'Identify', '22 F1 50', pos(ident) ? hxr(ident) : '--', nrc(ident) || '');
 
-                    add(false, 'Identify', '22 F1 50', hxr(ident), type ? type + ' (' + idx + ')' : interp(ident) || hxr(ident));
-
+                    // extended session
                     const sess = await ask(addr, 0x10, [0x03]);
-                    add(false, 'Ext session', '10 03', hxr(sess), sess && sess[0] === 0x50 ? 'accepted' : interp(sess) || 'no reply');
+                    const extOk = sess && sess[0] === 0x50;
+                    add(false, 'Ext session', '10 03', extOk ? 'accepted' : '--', nrc(sess) || (!sess ? 'no reply' : ''));
 
-                    const f4 = await ask(addr, 0x22, [0xF4, 0x01]);
-                    add(false, 'UDS readiness', '22 F4 01', hxr(f4), pos(f4) ? (f4.length - 3) + ' data bytes' : interp(f4) || 'no reply');
-
-                    if (sess && sess[0] === 0x50 && !pos(f4)) {
-                        await link.session(addr);
-                        const f4e = await ask(addr, 0x22, [0xF4, 0x01]);
-                        add(false, 'UDS after ext', '22 F4 01', hxr(f4e), pos(f4e) ? (f4e.length - 3) + ' data bytes' : interp(f4e) || 'no reply');
+                    // UDS readiness PIDs in default session
+                    p.step = name + ' UDS PIDs...'; changed();
+                    add(false, '— UDS (default session)', '', '', '');
+                    const udsResults = {};
+                    for (const pid of PROBE_PIDS) {
+                        const u = await ask(addr, 0x22, [0xF4, pid]);
+                        udsResults[pid] = u;
+                        const ok = pos(u);
+                        add(false, '  ' + PID_NAMES[pid], '22 F4 ' + h2(pid), ok ? (u.length - 3) + 'B: ' + hxr(u.slice(3), 8) : '--', nrc(u) || (!u ? 'no reply' : ''));
                     }
 
-                    const obd = await ask(addr, 0x01, [0x01]);
-                    add(false, 'OBD readiness', '01 01', hxr(obd), pos(obd) ? (obd.length - 2) + ' data bytes' : interp(obd) || 'no reply');
+                    // UDS PIDs after extended session (only if ext was accepted and at least one PID failed)
+                    const anyUdsFailed = PROBE_PIDS.some((pid) => !pos(udsResults[pid]));
+                    if (extOk && anyUdsFailed) {
+                        p.step = name + ' UDS ext...'; changed();
+                        await link.session(addr);
+                        add(false, '— UDS (after 10 03)', '', '', '');
+                        for (const pid of PROBE_PIDS) {
+                            if (pos(udsResults[pid])) continue;
+                            const u = await ask(addr, 0x22, [0xF4, pid]);
+                            const ok = pos(u);
+                            add(false, '  ' + PID_NAMES[pid], '22 F4 ' + h2(pid), ok ? (u.length - 3) + 'B: ' + hxr(u.slice(3), 8) : '--', nrc(u) || (!u ? 'no reply' : ''));
+                        }
+                    }
 
-                    const faults = await ask(addr, 0x19, [0x02, BMW_MASK]);
-                    const nd = faults && faults[0] === 0x59 ? Math.floor((faults.length - 3) / 4) : null;
-                    add(false, 'Fault memory', '19 02', hxr(faults), nd !== null ? nd + ' DTCs' : interp(faults) || 'no reply');
+                    // OBD PIDs
+                    p.step = name + ' OBD PIDs...'; changed();
+                    add(false, '— OBD', '', '', '');
+                    for (const pid of PROBE_PIDS) {
+                        const u = await ask(addr, 0x01, [pid]);
+                        const ok = pos(u);
+                        add(false, '  ' + PID_NAMES[pid], '01 ' + h2(pid), ok ? (u.length - 2) + 'B: ' + hxr(u.slice(2), 8) : '--', nrc(u) || (!u ? 'no reply' : ''));
+                    }
+
+                    // DTC services
+                    p.step = name + ' faults...'; changed();
+                    add(false, '— Fault services', '', '', '');
+
+                    const f19 = await ask(addr, 0x19, [0x02, BMW_MASK]);
+                    const nd = f19 && f19[0] === 0x59 ? Math.floor((f19.length - 3) / 4) : null;
+                    add(false, '  BMW faults', '19 02', nd !== null ? nd + ' DTCs' : '--', nrc(f19) || (!f19 ? 'no reply' : ''));
+
+                    for (const dtcSid of [0x03, 0x07, 0x0A]) {
+                        const dtcName = { 0x03: 'Confirmed P-codes', 0x07: 'Pending P-codes', 0x0A: 'Permanent P-codes' }[dtcSid];
+                        const u = await ask(addr, dtcSid, []);
+                        const ok = pos(u);
+                        const count = ok && u.length >= 2 ? Math.floor((u.length - 1) / 2) : null;
+                        add(false, '  ' + dtcName, h2(dtcSid), ok ? (count || 0) + ' codes' : '--', nrc(u) || (!u ? 'no reply' : ''));
+                    }
                 }
             } catch (e) { log.warn('probe: ' + e); }
 
@@ -546,8 +589,9 @@ mgu.run({
         }
 
         function drawProbe(cv, t) {
+            const ERR_COLOR = '#e05555';
             const p = G.panel(cv, t, 24, 44, 1552, 468, 'Diagnostic Probe');
-            const sub = S.probe ? (S.probe.done ? 'Complete · Refresh to re-scan' : S.probe.step || 'Scanning...') : 'Press Refresh to scan';
+            const sub = S.probe ? (S.probe.done ? S.probe.rows.length + ' rows · Refresh to re-scan' : S.probe.step || 'Scanning...') : 'Press Refresh to scan';
             cv.text(sub, 1552, 86, 18, t.dim, { align: 'right' });
 
             if (!S.probe || !S.probe.rows.length) {
@@ -555,23 +599,31 @@ mgu.run({
                 return;
             }
 
-            const rows = S.probe.rows, rh = 28, maxRows = Math.min(PROBE_PER_PAGE, Math.floor((p.h - 70) / rh));
+            // columns: label | req | detail | error
+            const rows = S.probe.rows, rh = 26, maxRows = Math.min(PROBE_PER_PAGE, Math.floor((p.h - 70) / rh));
             const pages = Math.ceil(rows.length / maxRows) || 1;
             probePage = Math.min(probePage, pages - 1);
             const shown = rows.slice(probePage * maxRows, (probePage + 1) * maxRows);
 
+            // column headers
+            cv.text('Request', 330, 100, 14, withAlpha(t.dim, 0.6), { font: 'num' });
+            cv.text('Result', 530, 100, 14, withAlpha(t.dim, 0.6));
+            cv.text('Error', 1050, 100, 14, withAlpha(ERR_COLOR, 0.6));
+
             shown.forEach((r, i) => {
                 const y = 118 + i * rh;
                 if (r.section) {
-                    cv.text(r.label, 48, y, 20, t.text, { font: 'bold' });
-                    if (r.detail) cv.text(fitText(cv, r.detail, 18, 500), 1552, y, 18, r.detail === 'not present' ? t.dim : t.text, { align: 'right' });
+                    cv.text(r.label, 48, y, 18, t.text, { font: 'bold' });
+                    if (r.detail) cv.text(fitText(cv, r.detail, 16, 420), 1130, y, 16, r.detail.indexOf('not present') >= 0 ? t.dim : t.text);
+                    if (r.err) cv.text(fitText(cv, r.err, 14, 300), 1050, y, 14, ERR_COLOR);
+                } else if (r.label.charAt(0) === '—') {
+                    cv.text(r.label, 60, y, 16, withAlpha(t.text, 0.7), { font: 'bold' });
                 } else {
-                    cv.text(r.label, 72, y, 18, t.dim);
-                    cv.text(r.req, 260, y, 16, withAlpha(t.text, 0.5), { font: 'num' });
-                    cv.text(fitText(cv, r.resp, 16, 400, { font: 'num' }), 430, y, 16, withAlpha(t.text, 0.6), { font: 'num' });
-                    const good = /data bytes|accepted|positive|DTCs/.test(r.detail);
-                    const bad = r.detail === 'no reply' || /refused|no replies/.test(r.detail);
-                    cv.text(fitText(cv, r.detail, 18, 440), 1100, y, 18, good ? GO : bad ? t.dim : t.text);
+                    cv.text(fitText(cv, r.label, 16, 240), 72, y, 16, t.dim);
+                    cv.text(r.req, 330, y, 14, withAlpha(t.text, 0.45), { font: 'num' });
+                    const good = r.detail !== '--' && !r.err;
+                    cv.text(fitText(cv, r.detail, 15, 480), 530, y, 15, good ? GO : t.dim, { font: r.detail.indexOf('B:') >= 0 ? 'num' : undefined });
+                    if (r.err) cv.text(fitText(cv, r.err, 14, 480), 1050, y, 14, ERR_COLOR);
                 }
             });
 
