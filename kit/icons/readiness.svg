@@ -1,0 +1,35 @@
+<!-- accent: #2fd27a -->
+<defs>
+  <linearGradient id="r-ring" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#b8ffe0"/><stop offset="0.3" stop-color="#2fd27a"/><stop offset="0.7" stop-color="#18a85a"/><stop offset="1" stop-color="#0a5c30"/></linearGradient>
+  <linearGradient id="r-track" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#2a2e34"/><stop offset="1" stop-color="#0e1014"/></linearGradient>
+  <radialGradient id="r-glow" cx="0.5" cy="0.5" r="0.5"><stop offset="0.5" stop-color="#2fd27a" stop-opacity="0"/><stop offset="0.85" stop-color="#2fd27a" stop-opacity="0.35"/><stop offset="1" stop-color="#2fd27a" stop-opacity="0"/></radialGradient>
+  <filter id="r-blur" x="-40%" y="-40%" width="180%" height="180%"><feGaussianBlur stdDeviation="4"/></filter>
+  <filter id="r-blur2" x="-30%" y="-30%" width="160%" height="160%"><feGaussianBlur stdDeviation="1.5"/></filter>
+  <linearGradient id="r-check" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#ffffff"/><stop offset="0.5" stop-color="#b8ffd8"/><stop offset="1" stop-color="#2fd27a"/></linearGradient>
+  <linearGradient id="r-leaf" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#60e898"/><stop offset="1" stop-color="#18a85a"/></linearGradient>
+</defs>
+<!-- glow behind the ring -->
+<circle cx="70" cy="70" r="52" fill="#2fd27a" filter="url(#r-blur)" opacity="0.5"/>
+<!-- track ring (dark) -->
+<circle cx="70" cy="70" r="44" fill="none" stroke="url(#r-track)" stroke-width="12" opacity="0.9"/>
+<!-- progress arc: ~75% complete (270 degrees), starts from top -->
+<path d="M70 26 A44 44 0 1 1 38.9 101.1" fill="none" stroke="#2fd27a" stroke-width="12" stroke-linecap="round" filter="url(#r-blur2)" opacity="0.7"/>
+<path d="M70 26 A44 44 0 1 1 38.9 101.1" fill="none" stroke="url(#r-ring)" stroke-width="10" stroke-linecap="round"/>
+<!-- segment ticks on the ring (8 monitors) -->
+<g stroke="#0a1a10" stroke-width="1.8" opacity="0.6">
+  <line x1="70" y1="24" x2="70" y2="30"/>
+  <line x1="101" y1="31" x2="97" y2="36"/>
+  <line x1="116" y1="62" x2="110" y2="64"/>
+  <line x1="114" y1="78" x2="108" y2="77"/>
+  <line x1="101" y1="109" x2="97" y2="104"/>
+  <line x1="70" y1="116" x2="70" y2="110"/>
+  <line x1="39" y1="109" x2="43" y2="104"/>
+  <line x1="24" y1="78" x2="30" y2="77"/>
+</g>
+<!-- checkmark in the centre -->
+<path d="M50 70 L63 84 L92 52" fill="none" stroke="#2fd27a" stroke-width="8" stroke-linecap="round" stroke-linejoin="round" filter="url(#r-blur)" opacity="0.7"/>
+<path d="M50 70 L63 84 L92 52" fill="none" stroke="url(#r-check)" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+<!-- small leaf / emissions symbol at top-right -->
+<path d="M108 24 C108 24 100 30 102 40 C104 48 112 46 114 38 C116 30 108 24 108 24 Z" fill="url(#r-leaf)" opacity="0.85"/>
+<path d="M108 38 C108 34 106 30 108 26" fill="none" stroke="#ffffff" stroke-width="1.2" stroke-linecap="round" opacity="0.6"/>
+<path d="M105 36 L108 38 L111 34" fill="none" stroke="#ffffff" stroke-width="0.9" stroke-linecap="round" opacity="0.4"/>
