@@ -150,38 +150,32 @@ mgu.run({
         }
 
         /* ---------- strobe controls ---------- */
+        var hex = function(r) { return r ? Array.from(r).map(function(b){return b.toString(16).toUpperCase().padStart(2,'0')}).join(' ') : 'null'; };
+
         async function startStrobe() {
             var pat = S.PATTERNS[selectedPattern];
-            if (!pat || !bdcOk) return;
+            if (!pat) return;
+            var linked = await ensureLink();
             var L = link();
-            sequencer.link = L;
-            var hex = function(r) { return r ? Array.from(r).map(function(b){return b.toString(16).toUpperCase().padStart(2,'0')}).join(' ') : 'null'; };
+            if (!linked) { status('TASU not ready'); return; }
 
-            status('Session 10 03...');
+            status('BDC 10 03...');
             var sess = await L.ask(0x40, 0x10, [0x03]);
             log.info('BDC 10 03 -> ' + hex(sess));
-            if (!sess || sess[0] === 0x7F) {
-                status('Session refused: ' + hex(sess));
-                return;
-            }
+            if (!sess) { status('BDC no reply to 10 03'); return; }
+            if (sess[0] === 0x7F) { status('10 03 NRC: ' + hex(sess)); return; }
 
-            // test: turn on DRL L and hold 2s so user can see it
-            status('Test: DRL L on...');
+            status('BDC 2F 6101 on...');
             var test = await L.ask(0x40, 0x2F, [0x61, 0x01, 0x03, 0x01]);
-            log.info('BDC 2F 6101 03 01 -> ' + hex(test));
-            status('2F resp: ' + hex(test));
+            log.info('BDC 2F 6101 -> ' + hex(test));
+            status('2F: ' + hex(test));
             await new Promise(function(r){ setTimeout(r, 2000); });
+            await L.ask(0x40, 0x2F, [0x61, 0x01, 0x00]);
 
-            // restore test light
-            var restore = await L.ask(0x40, 0x2F, [0x61, 0x01, 0x00]);
-            log.info('BDC 2F 6101 00 -> ' + hex(restore));
+            if (!test) { status('BDC no reply to 2F'); return; }
+            if (test[0] === 0x7F) { status('2F NRC: ' + hex(test)); return; }
 
-            if (!test || test[0] === 0x7F) {
-                status('IOControl refused: ' + hex(test));
-                await L.ask(0x40, 0x10, [0x01]).catch(function(){});
-                return;
-            }
-
+            sequencer.link = L;
             await sequencer.start(pat, strobeSpeed);
             changed();
         }
@@ -244,8 +238,7 @@ mgu.run({
             var cx = 600, cy = 142;
 
             var btnW = 200, btnH = 44;
-            var canPlay = bdcOk && phase === 'ready';
-            var btnColor = sequencer.running ? t.crit : canPlay ? (t.accent2 || t.accent) : withAlpha(t.dim, 0.3);
+            var btnColor = sequencer.running ? t.crit : (t.accent2 || t.accent);
             cv.roundRect(cx, cy, btnW, btnH, 8, btnColor);
             var btnLabel = sequencer.running ? 'STOP' : 'PLAY';
             cv.text(btnLabel, cx + btnW / 2, cy + 30, 20, '#FFFFFF', { align: 'center', font: 'bold' });
