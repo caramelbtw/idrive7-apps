@@ -48,6 +48,7 @@ mgu.run({
         // strobe state
         var selectedPattern = 0;
         var strobeSpeed = 1.0;     // 1.0 = normal, <1 = faster, >1 = slower
+        var diagLine = '';         // persistent diagnostic text on strobe page
         var sequencer = new S.Sequencer(link(), log);
         var activeOnIds = [];
         sequencer.onStep = function (step, onIds) {
@@ -153,31 +154,38 @@ mgu.run({
         var hex = function(r) { return r ? Array.from(r).map(function(b){return b.toString(16).toUpperCase().padStart(2,'0')}).join(' ') : 'null'; };
 
         async function startStrobe() {
-            var pat = S.PATTERNS[selectedPattern];
-            if (!pat) return;
-            var linked = await ensureLink();
-            var L = link();
-            if (!linked) { status('TASU not ready'); return; }
+            try {
+                var pat = S.PATTERNS[selectedPattern];
+                if (!pat) { diagLine = 'no pattern'; changed(); return; }
+                diagLine = 'TASU init...'; changed();
+                var linked = await ensureLink();
+                var L = link();
+                diagLine = 'link ready=' + linked; changed();
+                if (!linked) { diagLine = 'TASU not ready'; changed(); return; }
 
-            status('BDC 10 03...');
-            var sess = await L.ask(0x40, 0x10, [0x03]);
-            log.info('BDC 10 03 -> ' + hex(sess));
-            if (!sess) { status('BDC no reply to 10 03'); return; }
-            if (sess[0] === 0x7F) { status('10 03 NRC: ' + hex(sess)); return; }
+                diagLine = 'BDC 10 03...'; changed();
+                var sess = await L.ask(0x40, 0x10, [0x03]);
+                diagLine = '10 03: ' + hex(sess); changed();
+                if (!sess) { diagLine = 'BDC no reply'; changed(); return; }
+                if (sess[0] === 0x7F) { diagLine = '10 03 NRC: ' + hex(sess); changed(); return; }
 
-            status('BDC 2F 6101 on...');
-            var test = await L.ask(0x40, 0x2F, [0x61, 0x01, 0x03, 0x01]);
-            log.info('BDC 2F 6101 -> ' + hex(test));
-            status('2F: ' + hex(test));
-            await new Promise(function(r){ setTimeout(r, 2000); });
-            await L.ask(0x40, 0x2F, [0x61, 0x01, 0x00]);
+                diagLine = '2F 6101 on...'; changed();
+                var test = await L.ask(0x40, 0x2F, [0x61, 0x01, 0x03, 0x01]);
+                diagLine = '2F: ' + hex(test); changed();
+                await new Promise(function(r){ setTimeout(r, 2000); });
+                await L.ask(0x40, 0x2F, [0x61, 0x01, 0x00]);
 
-            if (!test) { status('BDC no reply to 2F'); return; }
-            if (test[0] === 0x7F) { status('2F NRC: ' + hex(test)); return; }
+                if (!test) { diagLine = '2F no reply'; changed(); return; }
+                if (test[0] === 0x7F) { diagLine = '2F NRC: ' + hex(test); changed(); return; }
 
-            sequencer.link = L;
-            await sequencer.start(pat, strobeSpeed);
-            changed();
+                diagLine = 'starting sequencer'; changed();
+                sequencer.link = L;
+                await sequencer.start(pat, strobeSpeed);
+                diagLine = 'running'; changed();
+            } catch (e) {
+                diagLine = 'ERR: ' + e.message; changed();
+                log.warn('startStrobe error: ' + e);
+            }
         }
 
         async function stopStrobe() {
@@ -267,6 +275,11 @@ mgu.run({
             cy += 72;
             cv.text('LIVE', cx, cy + 14, 13, t.dim, { font: 'bold', spacing: 1 });
             drawLightViz(cv, t, cx, cy + 24);
+
+            // persistent diagnostic line
+            if (diagLine) {
+                cv.text('DIAG: ' + diagLine, cx, 500, 13, '#FF9900', { font: 'bold' });
+            }
         }
 
         function drawLightViz(cv, t, ox, oy) {
