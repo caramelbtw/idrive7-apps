@@ -114,6 +114,7 @@ mgu.run({
         async function poll() {
             if (!ui.isVisible('MAIN')) return;
             if (phase === 'reading') return;
+            if (sequencer.running) return;
             if (phase === 'idle' || (phase === 'error' && Date.now() - lastRead > 8000) || Date.now() - lastRead > 30000) {
                 await probeAndRead();
             }
@@ -154,7 +155,25 @@ mgu.run({
             if (!pat || !bdcOk) return;
             var L = link();
             sequencer.link = L;
-            await L.ask(0x40, 0x10, [0x03]);
+            status('Entering extended session...');
+            var sess = await L.ask(0x40, 0x10, [0x03]);
+            if (!sess || sess[0] === 0x7F) {
+                var nrc = sess ? sess[2] : 0;
+                status('BDC session refused (NRC ' + nrc.toString(16) + ')');
+                log.warn('BDC 10 03 refused: ' + (sess ? Array.from(sess).map(function(b){return b.toString(16)}).join(' ') : 'no reply'));
+                return;
+            }
+            // verify IOControl works with one test command before starting sequencer
+            var test = await L.ask(0x40, 0x2F, [0x61, 0x01, 0x03, 0x01]);
+            if (!test || test[0] === 0x7F) {
+                var nrc2 = test ? test[2] : 0;
+                status('IOControl refused (NRC ' + nrc2.toString(16) + ')');
+                log.warn('BDC 2F test refused: ' + (test ? Array.from(test).map(function(b){return b.toString(16)}).join(' ') : 'no reply'));
+                await L.ask(0x40, 0x10, [0x01]).catch(function(){});
+                return;
+            }
+            // restore test light before sequencer takes over
+            await L.ask(0x40, 0x2F, [0x61, 0x01, 0x00]);
             await sequencer.start(pat, strobeSpeed);
             changed();
         }
