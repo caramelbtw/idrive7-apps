@@ -155,25 +155,33 @@ mgu.run({
             if (!pat || !bdcOk) return;
             var L = link();
             sequencer.link = L;
-            status('Entering extended session...');
+            var hex = function(r) { return r ? Array.from(r).map(function(b){return b.toString(16).toUpperCase().padStart(2,'0')}).join(' ') : 'null'; };
+
+            status('Session 10 03...');
             var sess = await L.ask(0x40, 0x10, [0x03]);
+            log.info('BDC 10 03 -> ' + hex(sess));
             if (!sess || sess[0] === 0x7F) {
-                var nrc = sess ? sess[2] : 0;
-                status('BDC session refused (NRC ' + nrc.toString(16) + ')');
-                log.warn('BDC 10 03 refused: ' + (sess ? Array.from(sess).map(function(b){return b.toString(16)}).join(' ') : 'no reply'));
+                status('Session refused: ' + hex(sess));
                 return;
             }
-            // verify IOControl works with one test command before starting sequencer
+
+            // test: turn on DRL L and hold 2s so user can see it
+            status('Test: DRL L on...');
             var test = await L.ask(0x40, 0x2F, [0x61, 0x01, 0x03, 0x01]);
+            log.info('BDC 2F 6101 03 01 -> ' + hex(test));
+            status('2F resp: ' + hex(test));
+            await new Promise(function(r){ setTimeout(r, 2000); });
+
+            // restore test light
+            var restore = await L.ask(0x40, 0x2F, [0x61, 0x01, 0x00]);
+            log.info('BDC 2F 6101 00 -> ' + hex(restore));
+
             if (!test || test[0] === 0x7F) {
-                var nrc2 = test ? test[2] : 0;
-                status('IOControl refused (NRC ' + nrc2.toString(16) + ')');
-                log.warn('BDC 2F test refused: ' + (test ? Array.from(test).map(function(b){return b.toString(16)}).join(' ') : 'no reply'));
+                status('IOControl refused: ' + hex(test));
                 await L.ask(0x40, 0x10, [0x01]).catch(function(){});
                 return;
             }
-            // restore test light before sequencer takes over
-            await L.ask(0x40, 0x2F, [0x61, 0x01, 0x00]);
+
             await sequencer.start(pat, strobeSpeed);
             changed();
         }
