@@ -331,6 +331,136 @@ class ProbeLink {
         return out;
     }
 
+    /* ---------- service discovery ---------- */
+
+    /**
+     * Probe which UDS services an ECU supports. Sends each service with minimal
+     * safe data — NRC 0x11 (serviceNotSupported) means no, any other reply means yes.
+     * Returns array of { sid, name, supported, nrc }.
+     */
+    async discoverServices(ecu) {
+        var services = [
+            { sid: 0x10, name: 'DiagnosticSessionControl', data: [0x01] },
+            { sid: 0x11, name: 'ECUReset', data: [0x01] },
+            { sid: 0x14, name: 'ClearDTC', data: [0xFF, 0xFF, 0xFF] },
+            { sid: 0x19, name: 'ReadDTCInformation', data: [0x02, 0xFF] },
+            { sid: 0x22, name: 'ReadDataByIdentifier', data: [0xF1, 0x50] },
+            { sid: 0x23, name: 'ReadMemoryByAddress', data: [0x14, 0x00, 0x00, 0x00, 0x01] },
+            { sid: 0x27, name: 'SecurityAccess', data: [0x01] },
+            { sid: 0x28, name: 'CommunicationControl', data: [0x00, 0x01] },
+            { sid: 0x2E, name: 'WriteDataByIdentifier', data: [0x00, 0x00] },
+            { sid: 0x2F, name: 'InputOutputControl', data: [0x00, 0x00, 0x00] },
+            { sid: 0x31, name: 'RoutineControl', data: [0x01, 0x00, 0x00] },
+            { sid: 0x34, name: 'RequestDownload', data: [0x00, 0x11, 0x00, 0x00] },
+            { sid: 0x36, name: 'TransferData', data: [0x01] },
+            { sid: 0x37, name: 'RequestTransferExit', data: [] },
+            { sid: 0x3E, name: 'TesterPresent', data: [0x00] },
+            { sid: 0x85, name: 'ControlDTCSetting', data: [0x01] },
+        ];
+        var out = [];
+        this.wake(ecu);
+        for (var i = 0; i < services.length; i++) {
+            var s = services[i];
+            var r = await this.askRaw(ecu, s.sid, s.data, this.scanTimeoutMs);
+            var supported = false, nrc = null;
+            if (r) {
+                if (r[0] === 0x7F && r[1] === s.sid) {
+                    nrc = r[2];
+                    supported = nrc !== 0x11;
+                } else {
+                    supported = true;
+                }
+            }
+            out.push({ sid: s.sid, name: s.name, supported: supported, nrc: nrc });
+        }
+        return out;
+    }
+
+    /* ---------- DID range scanner ---------- */
+
+    /**
+     * Sweep a DID range on an ECU to find all readable DIDs.
+     * Returns array of { did (hex string), bytes (data length), hex (first bytes preview) }.
+     * onProgress(scanned, total, found) called during sweep.
+     */
+    async scanDidRange(ecu, startDid, endDid, onProgress) {
+        var out = [];
+        var total = endDid - startDid + 1;
+        this.wake(ecu);
+        await this.ask(ecu, 0x10, [0x03]).catch(function () {});
+        for (var did = startDid; did <= endDid; did++) {
+            var d1 = (did >> 8) & 0xFF, d2 = did & 0xFF;
+            var didHex = hx(d1) + hx(d2);
+            var bytes = await this.readDid(ecu, didHex);
+            if (onProgress) onProgress(did - startDid + 1, total, out.length);
+            if (!bytes || bytes.length === 0) continue;
+            var preview = bytes.slice(0, 16).map(function (b) { return hx(b); }).join(' ');
+            if (bytes.length > 16) preview += ' ...';
+            out.push({ did: didHex, bytes: bytes.length, hex: preview });
+        }
+        this.ask(ecu, 0x10, [0x01]).catch(function () {});
+        return out;
+    }
+
+    /* ---------- fault reader ---------- */
+
+    /**
+     * Read BMW fault memory (19 02) from an ECU.
+     * Returns array of { code (hex string), status (byte), statusBits }.
+     */
+    async readFaults(ecu) {
+        this.wake(ecu);
+        var r = await this.ask(ecu, 0x19, [0x02, 0xFF]);
+        if (!r || r[0] !== 0x59 || r[1] !== 0x02) return null;
+        var out = [];
+        var i = 3;
+        while (i + 3 < r.length) {
+            var code = hx(r[i]) + hx(r[i + 1]) + hx(r[i + 2]);
+            var st = r[i + 3];
+            var bits = [];
+            if (st & 0x01) bits.push('testFailed');
+            if (st & 0x02) bits.push('currentDTC');
+            if (st & 0x04) bits.push('confirmedDTC');
+            if (st & 0x08) bits.push('testNotCompleted');
+            if (st & 0x10) bits.push('testFailedSinceLastClear');
+            if (st & 0x20) bits.push('testNotCompletedSinceLastClear');
+            if (st & 0x40) bits.push('testNotCompletedThisOp');
+            if (st & 0x80) bits.push('warningIndicatorRequested');
+            out.push({ code: code, status: st, statusBits: bits });
+            i += 4;
+        }
+        return out;
+    }
+
+    /* ---------- raw ask (bypasses check for service discovery) ---------- */
+
+    /**
+     * Send any service to an ECU and return the raw UDS reply, or null.
+     * Used internally for service discovery only — still read-only in effect
+     * because discovery sends minimal/invalid data that ECUs reject without acting.
+     */
+    askRaw(target, sid, data, timeoutMs) {
+        if (!Number.isInteger(target) || target < 0x00 || target > 0x7F) return Promise.resolve(null);
+        var d = Array.isArray(data) ? data.slice() : [];
+        var self = this;
+        var ms = timeoutMs || self.timeoutMs;
+        var run = async function () {
+            var wait = Math.max(0, self.next - Date.now());
+            if (wait) await sleep(wait);
+            try {
+                self.stats.sent++;
+                var accept = function (u) {
+                    return (u[0] === sid + 0x40) || (u[0] === 0x7F && u[1] === sid);
+                };
+                var uds = await LINKS.get(self).physical(target, sid, d, ms, accept);
+                if (!uds) { self.stats.missed++; return null; }
+                self.stats.replies++;
+                return uds;
+            } finally { self.next = Math.max(self.next, Date.now() + self.gapMs); }
+        };
+        return this.queue(run);
+    }
+
     /* ---------- logging ---------- */
 
     get logging() { return this._logging; }
@@ -408,4 +538,27 @@ class ProbeLink {
     }
 }
 
-module.exports = { ProbeLink, check, KNOWN_ECUS, SCAN_ADDRS, ID_DIDS, LOG_DIDS };
+/** Well-known DID ranges for the DID scanner page. */
+const DID_RANGES = Object.freeze([
+    { label: '0x1000-0x10FF  Status', start: 0x1000, end: 0x10FF },
+    { label: '0x2000-0x20FF  Measurement', start: 0x2000, end: 0x20FF },
+    { label: '0x3000-0x31FF  Coding / NCD', start: 0x3000, end: 0x31FF },
+    { label: '0x6000-0x610F  IOControl status', start: 0x6000, end: 0x610F },
+    { label: '0xD000-0xD1FF  Dynamic data', start: 0xD000, end: 0xD1FF },
+    { label: '0xF100-0xF1FF  Identification', start: 0xF100, end: 0xF1FF },
+    { label: '0xF400-0xF4FF  OBD as UDS', start: 0xF400, end: 0xF4FF },
+]);
+
+/** NRC code names for display. */
+const NRC_NAMES = Object.freeze({
+    0x10: 'generalReject', 0x11: 'serviceNotSupported', 0x12: 'subFunctionNotSupported',
+    0x13: 'incorrectMessageLength', 0x14: 'responseTooLong', 0x21: 'busyRepeatRequest',
+    0x22: 'conditionsNotCorrect', 0x24: 'requestSequenceError', 0x25: 'noResponseFromSubnet',
+    0x26: 'failurePreventsExecution', 0x31: 'requestOutOfRange', 0x33: 'securityAccessDenied',
+    0x35: 'invalidKey', 0x36: 'exceededNumberOfAttempts', 0x37: 'requiredTimeDelayNotExpired',
+    0x70: 'uploadDownloadNotAccepted', 0x71: 'transferDataSuspended', 0x72: 'generalProgrammingFailure',
+    0x73: 'wrongBlockSequenceCounter', 0x78: 'requestCorrectlyReceivedResponsePending',
+    0x7E: 'subFunctionNotSupportedInActiveSession', 0x7F: 'serviceNotSupportedInActiveSession',
+});
+
+module.exports = { ProbeLink, check, KNOWN_ECUS, SCAN_ADDRS, ID_DIDS, LOG_DIDS, DID_RANGES, NRC_NAMES };
