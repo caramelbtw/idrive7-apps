@@ -42,7 +42,7 @@ mgu.run({
         var phase = 'idle';           // idle | scanning | ready | error
         var statusMsg = '';
         var statusAt = 0;
-        var scanProgress = null;      // { scanned, total, found } during scan
+        var scanProgress = null;      // { phase, found } or { phase, current, total, found } during scan
 
         // scan state
         var ecus = [];                // [{ addr, name, sgbd, online }]
@@ -84,12 +84,16 @@ mgu.run({
                 return;
             }
 
-            status('Scanning 0x00-0x7F...');
-            scanProgress = { scanned: 0, total: 128, found: 0 };
+            status('Broadcasting to all ECUs...');
+            scanProgress = { phase: 'broadcast', found: 0 };
             changed();
             try {
-                ecus = await link.scan(function (scanned, total, found) {
-                    scanProgress = { scanned: scanned, total: total, found: found };
+                ecus = await link.scan(function (scanPhase, detail) {
+                    if (scanPhase === 'broadcast') {
+                        scanProgress = { phase: 'broadcast', found: detail.found };
+                    } else {
+                        scanProgress = { phase: 'identify', current: detail.current, total: detail.total, found: detail.found };
+                    }
                     changed();
                 });
                 scanProgress = null;
@@ -251,8 +255,10 @@ mgu.run({
 
             var conn, connColor;
             if (phase === 'scanning' || phase === 'idle') {
-                if (scanProgress) {
-                    conn = 'SCANNING ' + scanProgress.scanned + '/' + scanProgress.total + '  (' + scanProgress.found + ' found)';
+                if (scanProgress && scanProgress.phase === 'broadcast') {
+                    conn = 'BROADCAST...  (' + scanProgress.found + ' found)';
+                } else if (scanProgress && scanProgress.phase === 'identify') {
+                    conn = 'IDENTIFY ' + scanProgress.current + '/' + scanProgress.total + '  (' + scanProgress.found + ' done)';
                 } else {
                     conn = phase === 'scanning' ? 'SCANNING...' : 'CONNECTING...';
                 }
@@ -287,15 +293,29 @@ mgu.run({
             }
 
             if (ecus.length === 0) {
-                var msg = phase === 'scanning' ? 'Scanning all 128 diagnostic addresses...'
-                    : phase === 'error' ? (statusMsg || 'No ECUs found')
-                    : 'Press Refresh or FORCE RESCAN to scan';
-                cv.text(msg, 800, 300, 26, t.dim, { align: 'center' });
-                if (scanProgress) {
-                    var pct = Math.round(scanProgress.scanned / scanProgress.total * 100);
-                    cv.roundRect(400, 330, 800, 10, 5, withAlpha(t.dim, 0.1));
-                    if (pct > 0) cv.roundRect(400, 330, Math.round(800 * pct / 100), 10, 5, withAlpha(accent, 0.5));
-                    cv.text(pct + '%', 800, 362, 18, t.dim, { align: 'center' });
+                var msg, msg2;
+                if (phase === 'scanning' && scanProgress) {
+                    if (scanProgress.phase === 'broadcast') {
+                        msg = 'Broadcasting TesterPresent to all ECUs...';
+                        msg2 = scanProgress.found > 0 ? scanProgress.found + ' responding' : 'Waiting for replies...';
+                    } else {
+                        msg = 'Identifying ECU ' + scanProgress.current + ' of ' + scanProgress.total + '...';
+                        msg2 = scanProgress.found + ' identified';
+                    }
+                } else if (phase === 'scanning') {
+                    msg = 'Preparing broadcast...';
+                } else if (phase === 'error') {
+                    msg = statusMsg || 'No ECUs found';
+                } else {
+                    msg = 'Press Refresh or FORCE RESCAN to scan';
+                }
+                cv.text(msg, 800, 290, 26, t.dim, { align: 'center' });
+                if (msg2) cv.text(msg2, 800, 324, 20, withAlpha(accent, 0.7), { align: 'center' });
+                if (scanProgress && scanProgress.phase === 'identify') {
+                    var pct = Math.round(scanProgress.current / scanProgress.total * 100);
+                    cv.roundRect(400, 345, 800, 10, 5, withAlpha(t.dim, 0.1));
+                    if (pct > 0) cv.roundRect(400, 345, Math.round(800 * pct / 100), 10, 5, withAlpha(accent, 0.5));
+                    cv.text(pct + '%', 800, 377, 18, t.dim, { align: 'center' });
                 }
                 return;
             }

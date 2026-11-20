@@ -6,6 +6,11 @@
  * every ECU on the bus with read-only services so the user can discover what is
  * connected and watch what changes.
  *
+ * Scan strategy: a single functional broadcast (0xDF TesterPresent) discovers every
+ * online ECU in one transport request (~5 s). Physical requests then identify only
+ * the ECUs that actually answered. This avoids hammering the TASU with 128 individual
+ * requests that trigger APP_REQUEST_TEMPORARILY_NOT_ACCEPTED.
+ *
  * Allowed services (read-only - no write, no actuation, no clear):
  *   0x10  DiagnosticSessionControl (01 default, 03 extended) - needed to read some DIDs
  *   0x22  ReadDataByIdentifier     - any DID (identification, status, coding reads)
@@ -125,9 +130,6 @@ const KNOWN_ECUS = Object.freeze({
     0x79: 'IHKS climate 2',
 });
 
-/** Full sweep: every diagnostic address 0x00-0x7F for maximum coverage. */
-const SCAN_ADDRS = Object.freeze((function () { var a = []; for (var i = 0; i <= 0x7F; i++) a.push(i); return a; })());
-
 /** Identification DIDs to read from each discovered ECU. */
 const ID_DIDS = Object.freeze([
     { did: 'F150', name: 'SGBD index' },
@@ -203,9 +205,9 @@ class ProbeLink {
         diag.busyLog = true;
         LINKS.set(this, diag);
         this.log = log;
-        this.gapMs = (opts && opts.gapMs) || 80;
+        this.gapMs = (opts && opts.gapMs) || 100;
         this.timeoutMs = (opts && opts.timeoutMs) || 4000;
-        this.scanTimeoutMs = (opts && opts.scanTimeoutMs) || 1200;
+        this.scanTimeoutMs = (opts && opts.scanTimeoutMs) || 2000;
         this.silentAfter = (opts && opts.silentAfter) || 3;
         this.misses = {};
         this.stats = { sent: 0, replies: 0, missed: 0, blocked: 0 };
@@ -236,7 +238,7 @@ class ProbeLink {
             this.log.error('blocked: ' + e.message);
             return Promise.reject(e);
         }
-        if (this.silent(target)) return Promise.resolve(null);
+        if (target !== 0xDF && this.silent(target)) return Promise.resolve(null);
         var self = this;
         var ms = timeoutMs || self.timeoutMs;
         var run = async function () {
@@ -252,12 +254,12 @@ class ProbeLink {
                 if (!uds) { self.stats.missed++; self.misses[target] = (self.misses[target] || 0) + 1; return null; }
                 self.misses[target] = 0;
                 self.stats.replies++;
-                if (uds[0] === 0x7F && uds[2] === 0x21) self.next = Math.max(self.next, Date.now() + 1000);
+                if (uds[0] === 0x7F && uds[2] === 0x21) self.next = Math.max(self.next, Date.now() + 2000);
                 return uds;
             } catch (e) {
                 if (/transport refused/i.test(e.message)) {
-                    self.log.warn('transport refused for 0x' + hx(target) + ' sid ' + hx(sid) + ', backing off');
-                    self.next = Math.max(self.next, Date.now() + 2000);
+                    self.log.warn('transport refused for 0x' + hx(target) + ' sid ' + hx(sid) + ', backing off 3s');
+                    self.next = Math.max(self.next, Date.now() + 3000);
                     self.stats.missed++;
                     return null;
                 }
@@ -296,17 +298,83 @@ class ProbeLink {
     }
 
     /**
-     * Scan all 128 diagnostic addresses (0x00-0x7F): returns an array of { addr, name, sgbd, online }.
-     * Optional onProgress(scanned, total, found) callback for UI updates during the sweep.
+     * Discover all online ECUs using a single functional broadcast (0xDF).
+     * Sends TesterPresent to ALL ECUs at once — the TASU sends one request on the bus
+     * and every ECU that is alive answers. This replaces 128 individual pings.
+     *
+     * Returns Map(ecuAddress -> udsReply) of every ECU that responded.
+     */
+    async broadcast() {
+        var diag = LINKS.get(this);
+        this.log.info('broadcast: functional 3E 00 to 0xDF (all ECUs)');
+        try {
+            var replies = await diag.functional(0x3E, [0x00], {
+                idleMs: 5000,
+                maxMs: 15000,
+                onReply: function (ecu, count) {
+                    this.log.info('broadcast: ECU 0x' + hx(ecu) + ' answered (#' + count + ')');
+                }.bind(this),
+            });
+            this.log.info('broadcast: ' + replies.size + ' ECUs responded');
+            return replies;
+        } catch (e) {
+            this.log.warn('broadcast failed: ' + e.message);
+            if (/transport refused/i.test(e.message)) {
+                this.next = Math.max(this.next, Date.now() + 5000);
+                return new Map();
+            }
+            throw e;
+        }
+    }
+
+    /**
+     * Scan for all online ECUs. Two-phase approach:
+     *   Phase 1: functional broadcast (one TASU request) discovers all responding addresses
+     *   Phase 2: physical requests identify each responder (read F150 SGBD index)
+     *
+     * Returns array of { addr, name, sgbd, online }.
+     * onProgress(phase, detail) callback for UI updates:
+     *   phase='broadcast': detail = { found }
+     *   phase='identify':  detail = { current, total, found }
      */
     async scan(onProgress) {
+        this.wake();
         var results = [];
-        for (var i = 0; i < SCAN_ADDRS.length; i++) {
-            var addr = SCAN_ADDRS[i];
-            this.wake(addr);
-            var alive = await this.ping(addr);
-            if (onProgress) onProgress(i + 1, SCAN_ADDRS.length, results.length);
-            if (!alive) continue;
+
+        // Phase 1: broadcast discovery
+        if (onProgress) onProgress('broadcast', { found: 0 });
+        var replies = await this.broadcast();
+        var addrs = [];
+        replies.forEach(function (uds, ecu) { addrs.push(ecu); });
+        addrs.sort(function (a, b) { return a - b; });
+        if (onProgress) onProgress('broadcast', { found: addrs.length });
+
+        if (addrs.length === 0) {
+            this.log.warn('broadcast found no ECUs, falling back to known-address ping');
+            // fallback: try a small set of well-known addresses individually
+            var fallback = [0x02, 0x07, 0x10, 0x12, 0x18, 0x29, 0x40, 0x53, 0x58, 0x60, 0x78];
+            for (var fi = 0; fi < fallback.length; fi++) {
+                var fAddr = fallback[fi];
+                this.wake(fAddr);
+                if (onProgress) onProgress('identify', { current: fi + 1, total: fallback.length, found: results.length });
+                var fAlive = await this.ping(fAddr);
+                if (!fAlive) continue;
+                var fSgbd = await this.identify(fAddr);
+                results.push({
+                    addr: fAddr,
+                    name: KNOWN_ECUS[fAddr] || 'Unknown 0x' + hx(fAddr),
+                    sgbd: fSgbd,
+                    online: true,
+                });
+            }
+            return results;
+        }
+
+        // Phase 2: identify each responder — only the ECUs that actually answered
+        this.log.info('identify: reading SGBD from ' + addrs.length + ' ECUs');
+        for (var i = 0; i < addrs.length; i++) {
+            var addr = addrs[i];
+            if (onProgress) onProgress('identify', { current: i + 1, total: addrs.length, found: results.length });
             var sgbd = await this.identify(addr);
             results.push({
                 addr: addr,
@@ -314,8 +382,8 @@ class ProbeLink {
                 sgbd: sgbd,
                 online: true,
             });
-            if (onProgress) onProgress(i + 1, SCAN_ADDRS.length, results.length);
         }
+
         return results;
     }
 
@@ -466,8 +534,8 @@ class ProbeLink {
                 return uds;
             } catch (e) {
                 if (/transport refused/i.test(e.message)) {
-                    self.log.warn('askRaw transport refused for 0x' + hx(target) + ', backing off');
-                    self.next = Math.max(self.next, Date.now() + 2000);
+                    self.log.warn('askRaw transport refused for 0x' + hx(target) + ', backing off 3s');
+                    self.next = Math.max(self.next, Date.now() + 3000);
                     self.stats.missed++;
                     return null;
                 }
@@ -517,7 +585,7 @@ class ProbeLink {
             for (var j = 0; j < LOG_DIDS.length; j++) {
                 var did = LOG_DIDS[j];
                 var key = hx(addr) + ':' + did;
-                if (!(key in this._snapshot)) continue; // only track DIDs that existed at start
+                if (!(key in this._snapshot)) continue;
                 var bytes = await this.readDid(addr, did);
                 if (!bytes) continue;
                 var hexStr = bytes.map(function (b) { return hx(b); }).join(' ');
@@ -526,7 +594,7 @@ class ProbeLink {
                         ts: ts, addr: addr, did: did, type: 'change',
                         before: this._snapshot[key], after: hexStr,
                     });
-                    this._snapshot[key] = hexStr; // update snapshot so we track incremental changes
+                    this._snapshot[key] = hexStr;
                 }
             }
         }
@@ -577,4 +645,4 @@ const NRC_NAMES = Object.freeze({
     0x7E: 'subFunctionNotSupportedInActiveSession', 0x7F: 'serviceNotSupportedInActiveSession',
 });
 
-module.exports = { ProbeLink, check, KNOWN_ECUS, SCAN_ADDRS, ID_DIDS, LOG_DIDS, DID_RANGES, NRC_NAMES };
+module.exports = { ProbeLink, check, KNOWN_ECUS, ID_DIDS, LOG_DIDS, DID_RANGES, NRC_NAMES };
