@@ -199,13 +199,13 @@ class ProbeLink {
     constructor(signals, log, opts) {
         var diag = new Diag(signals, log);
         diag.quiet = true;
-        diag.busyMs = 200;
-        diag.busyLog = false;
+        diag.busyMs = 1000;
+        diag.busyLog = true;
         LINKS.set(this, diag);
         this.log = log;
-        this.gapMs = (opts && opts.gapMs) || 40;
-        this.timeoutMs = (opts && opts.timeoutMs) || 3000;
-        this.scanTimeoutMs = (opts && opts.scanTimeoutMs) || 800;
+        this.gapMs = (opts && opts.gapMs) || 80;
+        this.timeoutMs = (opts && opts.timeoutMs) || 4000;
+        this.scanTimeoutMs = (opts && opts.scanTimeoutMs) || 1200;
         this.silentAfter = (opts && opts.silentAfter) || 3;
         this.misses = {};
         this.stats = { sent: 0, replies: 0, missed: 0, blocked: 0 };
@@ -254,6 +254,14 @@ class ProbeLink {
                 self.stats.replies++;
                 if (uds[0] === 0x7F && uds[2] === 0x21) self.next = Math.max(self.next, Date.now() + 1000);
                 return uds;
+            } catch (e) {
+                if (/transport refused/i.test(e.message)) {
+                    self.log.warn('transport refused for 0x' + hx(target) + ' sid ' + hx(sid) + ', backing off');
+                    self.next = Math.max(self.next, Date.now() + 2000);
+                    self.stats.missed++;
+                    return null;
+                }
+                throw e;
             } finally { self.next = Math.max(self.next, Date.now() + self.gapMs); }
         };
         return this.queue(run);
@@ -456,6 +464,14 @@ class ProbeLink {
                 if (!uds) { self.stats.missed++; return null; }
                 self.stats.replies++;
                 return uds;
+            } catch (e) {
+                if (/transport refused/i.test(e.message)) {
+                    self.log.warn('askRaw transport refused for 0x' + hx(target) + ', backing off');
+                    self.next = Math.max(self.next, Date.now() + 2000);
+                    self.stats.missed++;
+                    return null;
+                }
+                throw e;
             } finally { self.next = Math.max(self.next, Date.now() + self.gapMs); }
         };
         return this.queue(run);
