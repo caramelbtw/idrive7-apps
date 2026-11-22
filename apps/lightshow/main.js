@@ -226,8 +226,8 @@ mgu.run({
                 conn = phase === 'reading' ? 'READING...' : 'CONNECTING...';
                 connColor = t.dim;
             } else if (page === 0) {
-                conn = bdcOk ? 'BDC CONNECTED' : 'NO LINK';
-                connColor = bdcOk ? '#2fd27a' : t.crit;
+                conn = diagLine || (bdcOk ? 'BDC CONNECTED' : 'NO LINK');
+                connColor = diagLine ? '#FF9900' : bdcOk ? '#2fd27a' : t.crit;
             } else {
                 conn = flmOk ? 'FLM CONNECTED' : bdcOk ? 'FLM UNAVAILABLE' : 'NO LINK';
                 connColor = flmOk ? '#2fd27a' : t.crit;
