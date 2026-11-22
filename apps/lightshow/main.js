@@ -48,7 +48,7 @@ mgu.run({
         // strobe state
         var selectedPattern = 0;
         var strobeSpeed = 1.0;     // 1.0 = normal, <1 = faster, >1 = slower
-        var diagLine = '';         // persistent diagnostic text on strobe page
+        var diagLine = 'tap PLAY to test BDC';
         var sequencer = new S.Sequencer(link(), log);
         var activeOnIds = [];
         sequencer.onStep = function (step, onIds) {
@@ -457,7 +457,7 @@ mgu.run({
                     if (x >= ct.x && x < ct.x + ct.w && y >= ct.y && y < ct.y + ct.h) {
                         if (ct.id === 'play_stop') {
                             if (sequencer.running) stopStrobe();
-                            else startStrobe();
+                            else { diagLine = 'PLAY tapped...'; changed(); startStrobe(); }
                         } else if (ct.speedValue !== undefined) {
                             strobeSpeed = ct.speedValue;
                             if (sequencer.running) {
