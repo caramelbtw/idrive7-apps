@@ -106,7 +106,7 @@ mgu.run({
                 statusMsg = 'No ECU reachable'; statusAt = Date.now();
             }
             if (bdcOk && !flmOk) {
-                statusMsg = 'FLM not routable via TASU'; statusAt = Date.now();
+                log.info('BDC ok, FLM not routable via TASU');
             }
             lastRead = Date.now();
             changed();
@@ -157,34 +157,53 @@ mgu.run({
             try {
                 var pat = S.PATTERNS[selectedPattern];
                 if (!pat) { diagLine = 'no pattern'; changed(); return; }
-                diagLine = 'TASU init...'; changed();
+                diagLine = 'init...'; changed();
                 var linked = await ensureLink();
                 var L = link();
-                diagLine = 'link ready=' + linked; changed();
                 if (!linked) { diagLine = 'TASU not ready'; changed(); return; }
 
-                diagLine = 'BDC 10 03...'; changed();
-                var sess = await L.ask(0x40, 0x10, [0x03]);
-                diagLine = '10 03: ' + hex(sess); changed();
-                if (!sess) { diagLine = 'BDC no reply'; changed(); return; }
-                if (sess[0] === 0x7F) { diagLine = '10 03 NRC: ' + hex(sess); changed(); return; }
+                // read a known DID first to verify BDC comms
+                diagLine = '22 F150...'; changed();
+                var id = await L.ask(0x40, 0x22, [0xF1, 0x50]);
+                diagLine = '22: ' + hex(id); changed();
+                if (!id) { diagLine = 'BDC no reply to 22'; changed(); return; }
 
-                diagLine = '2F 6101 on...'; changed();
+                diagLine = '10 03...'; changed();
+                var sess = await L.ask(0x40, 0x10, [0x03]);
+                diagLine = '10: ' + hex(sess); changed();
+                if (!sess || sess[0] === 0x7F) { diagLine = '10 fail: ' + hex(sess); changed(); return; }
+
+                diagLine = '2F 6101 03 01...'; changed();
                 var test = await L.ask(0x40, 0x2F, [0x61, 0x01, 0x03, 0x01]);
                 diagLine = '2F: ' + hex(test); changed();
+
+                if (!test) {
+                    diagLine = '2F: no reply (TASU may not route 0x2F)';
+                    changed();
+                    await L.ask(0x40, 0x10, [0x01]).catch(function(){});
+                    return;
+                }
+                if (test[0] === 0x7F) {
+                    var nrcNames = {0x12:'subFunction',0x13:'msgLen',0x14:'respLen',0x22:'conditions',0x31:'outOfRange',0x33:'secAccess',0x72:'gpf'};
+                    var n = test[2]; var nm = nrcNames[n] || '';
+                    diagLine = '2F NRC ' + n.toString(16) + (nm ? ' (' + nm + ')' : '') + ' ' + hex(test);
+                    changed();
+                    await L.ask(0x40, 0x10, [0x01]).catch(function(){});
+                    return;
+                }
+
+                // IOControl accepted — hold DRL L on 2s so user sees it
+                diagLine = '2F OK! DRL L on 2s...'; changed();
                 await new Promise(function(r){ setTimeout(r, 2000); });
                 await L.ask(0x40, 0x2F, [0x61, 0x01, 0x00]);
 
-                if (!test) { diagLine = '2F no reply'; changed(); return; }
-                if (test[0] === 0x7F) { diagLine = '2F NRC: ' + hex(test); changed(); return; }
-
-                diagLine = 'starting sequencer'; changed();
+                diagLine = 'sequencer go'; changed();
                 sequencer.link = L;
                 await sequencer.start(pat, strobeSpeed);
                 diagLine = 'running'; changed();
             } catch (e) {
-                diagLine = 'ERR: ' + e.message; changed();
-                log.warn('startStrobe error: ' + e);
+                diagLine = 'ERR: ' + String(e).slice(0, 60); changed();
+                log.warn('startStrobe: ' + e);
             }
         }
 
@@ -276,9 +295,10 @@ mgu.run({
             cv.text('LIVE', cx, cy + 14, 13, t.dim, { font: 'bold', spacing: 1 });
             drawLightViz(cv, t, cx, cy + 24);
 
-            // persistent diagnostic line
+            // persistent diagnostic line — below header, above patterns
             if (diagLine) {
-                cv.text('DIAG: ' + diagLine, cx, 500, 13, '#FF9900', { font: 'bold' });
+                cv.roundRect(cx, 100, 500, 24, 4, 'rgba(255,153,0,0.15)');
+                cv.text(diagLine, cx + 250, 118, 14, '#FF9900', { align: 'center', font: 'bold' });
             }
         }
 
