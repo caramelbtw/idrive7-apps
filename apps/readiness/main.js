@@ -33,13 +33,14 @@ const { ReadinessLink, UNITS, ALL } = require('./link');
 const M = require('./monitors');
 const DEMO = require('./demo');
 const BMW = require('./bmw');
+const TP = require('./transport-probe');
 
 const W = 1600, H = 520;
 const GO = '#2fd27a';
 const ENGINES = [0x12, 0x13];
 const READ_MS = 10000, SLOW_MS = 30000;
 const BMW_MASK = 0x0C;            // 19 02 status mask: pending and confirmed (stored) faults, as Fault Scanner's "Current"
-const TABS = ['Readiness', 'Faults', 'Drive plan', 'Probe', 'Sweep'];
+const TABS = ['Readiness', 'Faults', 'Drive plan', 'Probe', 'Sweep', 'Transport'];
 const PLAN_PER_PAGE = 4;
 const PROBE_PER_PAGE = 14;
 
@@ -69,9 +70,10 @@ mgu.run({
                 readAt: 0, slowAt: 0, error: '',
                 probe: null,               // { rows: [{ section, label, req, detail, err }], step, done }
                 sweep: null,               // { hits: [{ did, hex, data, len }], step, done, ranges, total, scanned }
+                transport: null,           // { results: [{ test, ok, detail, error, raw }], step, done, summary }
             };
         }
-        let page = 0, planPage = 0, probePage = 0, version = 0, busy = false, forced = false, probing = false, sweeping = false;
+        let page = 0, planPage = 0, probePage = 0, version = 0, busy = false, forced = false, probing = false, sweeping = false, transportProbing = false;
         const changed = () => { version++; if (loop) loop.kick(); };
 
         /** one request: the demo car's reply or the real unit's (null: no answer) */
@@ -800,6 +802,108 @@ mgu.run({
             if (pages > 1) cv.text('Page ' + (sweepPage + 1) + ' of ' + pages, 1552, p.y + p.h - 18, 18, t.dim, { align: 'right' });
         }
 
+        /* ---------- transport probe ---------- */
+        let transportPage = 0;
+        const TRANSPORT_PER_PAGE = 14;
+
+        async function runTransportProbe() {
+            if (transportProbing) return;
+            transportProbing = true;
+            const tp = { results: [], step: 'Starting transport probe...', done: false, summary: '' };
+            S.transport = tp;
+            transportPage = 0;
+            changed();
+
+            try {
+                const r = await TP.probe(ctx.signals, log, {
+                    onStep: (step, count) => { tp.step = step; changed(); },
+                });
+                tp.results = r.results;
+                tp.summary = r.summary;
+            } catch (e) {
+                log.warn('transport probe: ' + e);
+                tp.summary = 'Error: ' + e.message;
+            }
+
+            tp.step = '';
+            tp.done = true;
+            transportProbing = false;
+            changed();
+        }
+
+        function drawTransport(cv, t) {
+            const ERR_COLOR = '#e05555';
+            const CYAN = '#40c8e0';
+            const p = G.panel(cv, t, 24, 44, 1552, 468, 'Transport Probe — CAN / DoIP / TASU');
+
+            const tp = S.transport;
+            if (!tp) {
+                cv.text('Press Refresh to probe for alternate diagnostic transports.', 48, 140, 22, t.dim);
+                cv.text('Tests whether this head unit can reach the DME (engine ECU) through:', 48, 180, 18, t.dim);
+                cv.text('1. SocketCAN — raw CAN bus (if the MGU has CAN interfaces)', 72, 216, 18, t.dim);
+                cv.text('2. DoIP — Diagnostics over IP on port 13400 (vehicle Ethernet)', 72, 244, 18, t.dim);
+                cv.text('3. TASU with alternate source addresses (0xF1 external tester)', 72, 272, 18, t.dim);
+                cv.text('Every request is OBD-II mode 01 PID 00 (supported PIDs) — harmless, read-only.', 48, 316, 16, withAlpha(t.dim, 0.7));
+                cv.text('The goal: find a transport where the DME answers readiness requests.', 48, 342, 16, withAlpha(t.dim, 0.7));
+                return;
+            }
+
+            const sub = tp.done
+                ? tp.results.length + ' tests · ' + tp.results.filter((r) => r.ok).length + ' passed · Refresh to re-probe'
+                : tp.step || 'Probing...';
+            cv.text(sub, 1552, 86, 16, t.dim, { align: 'right' });
+
+            if (!tp.results.length && !tp.done) {
+                cv.text('Probing transports...', 48, 200, 22, t.dim);
+                return;
+            }
+
+            // summary banner
+            if (tp.done && tp.summary) {
+                const anyOk = tp.results.some((r) => r.ok && !r.test.includes('0xF2') && !r.test.includes('installed'));
+                const bannerColor = anyOk ? GO : '#e0a030';
+                cv.roundRect(40, 94, 900, 32, 6, withAlpha(bannerColor, 0.15));
+                cv.text(fitText(cv, tp.summary, 18, 880, { font: 'bold' }), 52, 118, 18, bannerColor, { font: 'bold' });
+            }
+
+            // column headers
+            const ry = tp.done && tp.summary ? 140 : 108;
+            cv.text('Test', 48, ry, 14, withAlpha(t.dim, 0.6), { font: 'bold' });
+            cv.text('Result', 530, ry, 14, withAlpha(t.dim, 0.6));
+            cv.text('Error / Note', 1000, ry, 14, withAlpha(t.dim, 0.6));
+
+            const rows = tp.results, rh = 28;
+            const baseY = ry + 14;
+            const maxRows = Math.min(TRANSPORT_PER_PAGE, Math.floor((p.y + p.h - baseY - 20) / rh));
+            const pages = Math.ceil(rows.length / maxRows) || 1;
+            transportPage = Math.min(transportPage, pages - 1);
+            const shown = rows.slice(transportPage * maxRows, (transportPage + 1) * maxRows);
+
+            shown.forEach((r, i) => {
+                const y = baseY + 4 + i * rh;
+                // status indicator
+                const sc = r.ok ? GO : (r.error ? ERR_COLOR : t.dim);
+                cv.circle(56, y + 2, 6, sc);
+                if (r.ok) {
+                    cv.line(52, y + 2, 55, y + 5, 2, t.bg);
+                    cv.line(55, y + 5, 60, y - 2, 2, t.bg);
+                }
+                // test name
+                const isTasu = r.test.startsWith('TASU');
+                const isCan = r.test.startsWith('CAN');
+                const isDoip = r.test.startsWith('DoIP');
+                const nameColor = isTasu ? CYAN : isCan ? '#e0a030' : isDoip ? '#a080e0' : t.text;
+                cv.text(fitText(cv, r.test, 16, 440), 72, y + 7, 16, nameColor);
+                // detail
+                const detailColor = r.ok ? GO : t.dim;
+                cv.text(fitText(cv, r.detail, 15, 440), 530, y + 7, 15, detailColor, { font: r.raw ? 'num' : undefined });
+                // error
+                if (r.error) cv.text(fitText(cv, r.error, 14, 540), 1000, y + 7, 14, r.ok ? t.dim : ERR_COLOR);
+            });
+
+            if (pages > 1) cv.text('Page ' + (transportPage + 1) + ' of ' + pages, 1552, p.y + p.h - 18, 18, t.dim, { align: 'right' });
+        }
+
         let drawn = -1;
         async function render(force) {
             if (!force && drawn === version) return;
@@ -809,26 +913,29 @@ mgu.run({
             else if (page === 1) drawFaults(cv, t);
             else if (page === 2) drawPlan(cv, t, v);
             else if (page === 3) drawProbe(cv, t);
-            else drawSweep(cv, t);
+            else if (page === 4) drawSweep(cv, t);
+            else drawTransport(cv, t);
             const reading = S.phase === 'connecting' || busy;
-            G.frame(cv, t, TABS, page, [S.demo && { text: 'DEMO' }, reading && { text: 'READING', color: 'accent2' }, probing && { text: 'PROBING', color: 'accent2' }, sweeping && { text: 'SWEEPING', color: 'accent2' }]);
+            G.frame(cv, t, TABS, page, [S.demo && { text: 'DEMO' }, reading && { text: 'READING', color: 'accent2' }, probing && { text: 'PROBING', color: 'accent2' }, sweeping && { text: 'SWEEPING', color: 'accent2' }, transportProbing && { text: 'TESTING', color: 'accent2' }]);
             await ui.image('MAIN_GFX', cv);
         }
 
-        ui.onClick('BTN_REFRESH', () => { if (page === 4) { runSweep(); } else if (page === 3) { runProbe(); } else { forced = true; poll(); } changed(); });
+        ui.onClick('BTN_REFRESH', () => { if (page === 5) { runTransportProbe(); } else if (page === 4) { runSweep(); } else if (page === 3) { runProbe(); } else { forced = true; poll(); } changed(); });
         ui.onClick('BTN_PAGE', () => {
             const pl = view().plan, pages = Math.ceil(pl.steps.length / PLAN_PER_PAGE);
             if (page === 2 && planPage + 1 < pages) planPage++;
             else if (page === 3 && S.probe) { const pp = Math.ceil(S.probe.rows.length / PROBE_PER_PAGE) || 1; if (probePage + 1 < pp) { probePage++; changed(); return; } else { page = (page + 1) % TABS.length; probePage = 0; } }
-            else if (page === 4 && S.sweep && S.sweep.hits.length) { const sp = Math.ceil(S.sweep.hits.length / SWEEP_PER_PAGE) || 1; if (sweepPage + 1 < sp) { sweepPage++; changed(); return; } else { page = 0; sweepPage = 0; } }
-            else { page = (page + 1) % TABS.length; planPage = 0; probePage = 0; sweepPage = 0; }
+            else if (page === 4 && S.sweep && S.sweep.hits.length) { const sp = Math.ceil(S.sweep.hits.length / SWEEP_PER_PAGE) || 1; if (sweepPage + 1 < sp) { sweepPage++; changed(); return; } else { page = (page + 1) % TABS.length; sweepPage = 0; } }
+            else if (page === 5 && S.transport && S.transport.results.length) { const tp = Math.ceil(S.transport.results.length / TRANSPORT_PER_PAGE) || 1; if (transportPage + 1 < tp) { transportPage++; changed(); return; } else { page = 0; transportPage = 0; } }
+            else { page = (page + 1) % TABS.length; planPage = 0; probePage = 0; sweepPage = 0; transportPage = 0; }
             changed();
         });
         ctx.onTab((i) => {
             if (i === page && i === 2) { const pages = Math.ceil(view().plan.steps.length / PLAN_PER_PAGE) || 1; planPage = (planPage + 1) % pages; }
             else if (i === page && i === 3 && S.probe) { const pp = Math.ceil(S.probe.rows.length / PROBE_PER_PAGE) || 1; probePage = (probePage + 1) % pp; }
             else if (i === page && i === 4 && S.sweep && S.sweep.hits.length) { const sp = Math.ceil(S.sweep.hits.length / SWEEP_PER_PAGE) || 1; sweepPage = (sweepPage + 1) % sp; }
-            else { page = i; planPage = 0; probePage = 0; sweepPage = 0; if (i === 3 && !S.probe && !probing) runProbe(); }
+            else if (i === page && i === 5 && S.transport && S.transport.results.length) { const tp = Math.ceil(S.transport.results.length / TRANSPORT_PER_PAGE) || 1; transportPage = (transportPage + 1) % tp; }
+            else { page = i; planPage = 0; probePage = 0; sweepPage = 0; transportPage = 0; if (i === 3 && !S.probe && !probing) runProbe(); if (i === 5 && !S.transport && !transportProbing) runTransportProbe(); }
             changed();
         });
         ctx.onLayout(changed);
