@@ -842,7 +842,7 @@ mgu.run({
         ctx.onLayout(changed);
         settings.onChange(function () { changed(); });
 
-        setTimeout(function () { doScan(); }, 1500);
+        setTimeout(function () { doScan(); }, 2500);
 
         setInterval(function () {
             if ((logging || didScanning) && ui.isVisible('MAIN')) changed();

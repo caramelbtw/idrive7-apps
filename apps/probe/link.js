@@ -220,7 +220,20 @@ class ProbeLink {
         this._snapshot = {};   // 'addr:did' -> hex string of bytes at log start
     }
 
-    async init() { await LINKS.get(this).init(); return this; }
+    async init() {
+        var diag = LINKS.get(this);
+        await diag.init();
+        if (!diag.available) {
+            var self = this;
+            await new Promise(function (resolve) {
+                var timer = setTimeout(function () { diag.removeListener('available', onAvail); resolve(); }, 5000);
+                function onAvail(a) { if (a) { clearTimeout(timer); diag.removeListener('available', onAvail); resolve(); } }
+                diag.on('available', onAvail);
+            });
+            self.log.info('TASU available after wait: ' + diag.available);
+        }
+        return this;
+    }
     get available() { return LINKS.get(this).available; }
     get ready() { return !!LINKS.get(this).p; }
     get failed() { return LINKS.get(this).error; }
@@ -299,32 +312,39 @@ class ProbeLink {
 
     /**
      * Discover all online ECUs using a single functional broadcast (0xDF).
-     * Sends TesterPresent to ALL ECUs at once — the TASU sends one request on the bus
-     * and every ECU that is alive answers. This replaces 128 individual pings.
+     * Uses ReadDTCInformation (0x19 02 FF) — the same service the working DTC
+     * scanner app uses, proven reliable on BMW TASU. Some gateways rate-limit
+     * or reject functional TesterPresent (0x3E), but 0x19 always gets through.
      *
+     * Retries up to 3 times with a 3-second pause between attempts.
      * Returns Map(ecuAddress -> udsReply) of every ECU that responded.
      */
     async broadcast() {
         var diag = LINKS.get(this);
-        this.log.info('broadcast: functional 3E 00 to 0xDF (all ECUs)');
-        try {
-            var replies = await diag.functional(0x3E, [0x00], {
-                idleMs: 5000,
-                maxMs: 15000,
-                onReply: function (ecu, count) {
-                    this.log.info('broadcast: ECU 0x' + hx(ecu) + ' answered (#' + count + ')');
-                }.bind(this),
-            });
-            this.log.info('broadcast: ' + replies.size + ' ECUs responded');
-            return replies;
-        } catch (e) {
-            this.log.warn('broadcast failed: ' + e.message);
-            if (/transport refused/i.test(e.message)) {
-                this.next = Math.max(this.next, Date.now() + 5000);
-                return new Map();
+        var self = this;
+        for (var attempt = 0; attempt < 3; attempt++) {
+            if (attempt > 0) {
+                self.log.info('broadcast: retry ' + attempt + ' after 3s');
+                await sleep(3000);
             }
-            throw e;
+            self.log.info('broadcast: functional 19 02 FF to 0xDF (all ECUs), attempt ' + (attempt + 1));
+            try {
+                var replies = await diag.functional(0x19, [0x02, 0xFF], {
+                    idleMs: 5000,
+                    maxMs: 15000,
+                    onReply: function (ecu, count) {
+                        self.log.info('broadcast: ECU 0x' + hx(ecu) + ' answered (#' + count + ')');
+                    },
+                });
+                self.log.info('broadcast: ' + replies.size + ' ECUs responded');
+                if (replies.size > 0) return replies;
+            } catch (e) {
+                self.log.warn('broadcast attempt ' + (attempt + 1) + ' failed: ' + e.message);
+                if (!/transport refused/i.test(e.message)) throw e;
+            }
         }
+        self.log.warn('broadcast: all attempts exhausted, returning empty');
+        return new Map();
     }
 
     /**
