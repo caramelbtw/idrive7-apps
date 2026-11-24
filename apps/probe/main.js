@@ -25,15 +25,22 @@ mgu.run({
     async start(ctx) {
         const { ui, settings, log } = ctx;
         const link = new ProbeLink(ctx.signals, log);
-        var linkInited = false;
+        var linkReady = false;
+        var linkPromise = null;
 
         async function ensureLink() {
-            if (!linkInited) {
-                linkInited = true;
-                await link.init();
-                log.info('TASU init done: ready=' + link.ready + ' available=' + link.available + ' failed=' + link.failed);
+            if (linkReady) return true;
+            if (!linkPromise) {
+                linkPromise = link.init().then(function () {
+                    linkReady = link.ready;
+                    log.info('TASU init done: ready=' + link.ready + ' available=' + link.available + ' failed=' + link.failed);
+                }).catch(function (e) {
+                    log.warn('TASU init failed: ' + e);
+                    linkPromise = null;
+                });
             }
-            return link.ready;
+            await linkPromise;
+            return linkReady;
         }
         ensureLink();
 
@@ -641,7 +648,7 @@ mgu.run({
                     if (x >= rt.x && x < rt.x + rt.w && y >= rt.y && y < rt.y + rt.h) {
                         phase = 'idle'; ecus = []; selectedIdx = -1; ecuDetail = [];
                         ecuServices = []; servicesLoaded = false; didResults = [];
-                        faults = null; linkInited = false; link.wake();
+                        faults = null; linkReady = false; linkPromise = null; link.wake();
                         doScan(); changed(); return;
                     }
                 }
@@ -688,7 +695,7 @@ mgu.run({
             if (page === 0) {
                 phase = 'idle'; ecus = []; selectedIdx = -1; ecuDetail = [];
                 ecuServices = []; servicesLoaded = false; didResults = [];
-                faults = null; linkInited = false; link.wake();
+                faults = null; linkReady = false; linkPromise = null; link.wake();
                 doScan();
             } else if (page === 1) {
                 ecuDetail = []; ecuServices = []; servicesLoaded = false;
