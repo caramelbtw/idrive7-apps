@@ -74,6 +74,8 @@ mgu.run({
         var logDiffs = [];            // changes found
         var logStatus = '';           // status text for log page
         var logPollTimer = null;
+        var logSelected = {};         // { addr: true/false } — which ECUs to log
+        var logSnapshotCount = 0;     // DIDs found during snapshot
 
         var changed = function () { version++; if (loop) loop.kick(); };
         var status = function (msg) { statusMsg = msg; statusAt = Date.now(); changed(); };
@@ -216,19 +218,43 @@ mgu.run({
         }
 
         /* ---------- logging ---------- */
+
+        function initLogSelection() {
+            if (ecus.length === 0) return;
+            var hasAny = false;
+            for (var i = 0; i < ecus.length; i++) {
+                if (logSelected[ecus[i].addr] !== undefined) hasAny = true;
+            }
+            if (!hasAny) {
+                for (var j = 0; j < ecus.length; j++) logSelected[ecus[j].addr] = true;
+            }
+        }
+
+        function getLogAddrs() {
+            var addrs = [];
+            for (var i = 0; i < ecus.length; i++) {
+                if (logSelected[ecus[i].addr]) addrs.push(ecus[i].addr);
+            }
+            return addrs;
+        }
+
         async function startLogging() {
             if (logging) return;
             if (ecus.length === 0) { status('Scan first'); return; }
+            initLogSelection();
+            var addrs = getLogAddrs();
+            if (addrs.length === 0) { status('Select at least one ECU'); return; }
             logging = true;
             logDiffs = [];
+            logSnapshotCount = 0;
             logStartTime = Date.now();
-            logStatus = 'Taking initial snapshot...';
+            logStatus = 'Snapshot: ' + addrs.length + ' ECU' + (addrs.length === 1 ? '' : 's') + '...';
             changed();
 
-            var addrs = ecus.map(function (e) { return e.addr; });
             try {
                 await link.startLog(addrs);
-                logStatus = 'Logging... perform an action, then stop.';
+                logSnapshotCount = link.getLog().filter(function (e) { return e.type === 'snapshot'; }).length;
+                logStatus = 'Logging ' + addrs.length + ' ECU' + (addrs.length === 1 ? '' : 's') + ' (' + logSnapshotCount + ' DIDs)... perform an action, then stop.';
                 changed();
                 logPollTimer = setInterval(function () {
                     if (!logging) return;
@@ -551,32 +577,87 @@ mgu.run({
 
         // ---- Log page ----
 
+        // ---- Log page ----
+
+        var logEcuTapTargets = [];
+        var logBtnTarget = null;
+        var logAllBtnTarget = null;
+        var logNoneBtnTarget = null;
+
         function drawLogPage(cv, t) {
+            logEcuTapTargets = [];
+            logBtnTarget = null;
+            logAllBtnTarget = null;
+            logNoneBtnTarget = null;
             var accent = t.accent2 || t.accent;
 
-            cv.text('TRAFFIC LOGGER', 48, 128, 15, t.dim, { font: 'bold', spacing: 1 });
+            if (ecus.length === 0) {
+                cv.text('Scan for ECUs first, then select which to log', 800, 300, 24, t.dim, { align: 'center' });
+                return;
+            }
 
-            var btnW = 200, btnH = 40;
+            initLogSelection();
+
+            // start/stop button
+            var btnW = 200, btnH = 36;
             var btnColor = logging ? t.crit : accent;
-            cv.roundRect(48, 140, btnW, btnH, 8, btnColor);
+            cv.roundRect(48, 110, btnW, btnH, 8, btnColor);
             var btnLabel = logging ? 'STOP LOG' : 'START LOG';
-            cv.text(btnLabel, 48 + btnW / 2, 166, 18, '#FFFFFF', { align: 'center', font: 'bold' });
+            cv.text(btnLabel, 48 + btnW / 2, 134, 16, '#FFFFFF', { align: 'center', font: 'bold' });
+            logBtnTarget = { x: 48, y: 110, w: btnW, h: btnH };
 
-            cv.text(logStatus || (ecus.length === 0 ? 'Scan for ECUs first' : 'Ready to log'), 270, 166, 18, t.dim);
+            // status text
+            var statusX = 270;
+            cv.text(logStatus || 'Select ECUs to monitor, then start', statusX, 134, 16, t.dim);
 
             if (logging) {
                 var elapsed = ((Date.now() - logStartTime) / 1000).toFixed(0);
-                cv.text(elapsed + 's', 1552, 166, 18, t.crit, { align: 'right', font: 'bold' });
+                cv.text(elapsed + 's', 1552, 134, 16, t.crit, { align: 'right', font: 'bold' });
                 var liveChanges = link.getLog().filter(function (e) { return e.type === 'change'; });
                 if (liveChanges.length > 0) {
-                    cv.text(liveChanges.length + ' change' + (liveChanges.length === 1 ? '' : 's') + ' so far', 1552, 128, 15, t.warn, { align: 'right', font: 'bold' });
+                    cv.text(liveChanges.length + ' change' + (liveChanges.length === 1 ? '' : 's'), 1552, 116, 13, t.warn, { align: 'right', font: 'bold' });
                 }
             }
 
+            // ECU selector — tappable pills (only when not logging)
+            if (!logging) {
+                var selCount = getLogAddrs().length;
+                cv.text('LOG ECUS  (' + selCount + '/' + ecus.length + ')', 48, 164, 12, t.dim, { font: 'bold', spacing: 1 });
+
+                // all / none buttons
+                var abx = 250;
+                cv.roundRect(abx, 152, 44, 20, 5, withAlpha(accent, 0.15));
+                cv.text('ALL', abx + 22, 166, 11, accent, { align: 'center', font: 'bold' });
+                logAllBtnTarget = { x: abx, y: 152, w: 44, h: 20 };
+                cv.roundRect(abx + 52, 152, 56, 20, 5, withAlpha(t.dim, 0.15));
+                cv.text('NONE', abx + 80, 166, 11, t.dim, { align: 'center', font: 'bold' });
+                logNoneBtnTarget = { x: abx + 52, y: 152, w: 56, h: 20 };
+
+                var px = 48, py = 176;
+                for (var i = 0; i < ecus.length; i++) {
+                    var ecu = ecus[i];
+                    var on = !!logSelected[ecu.addr];
+                    var label = hx(ecu.addr) + ' ' + (ecu.name.length > 12 ? ecu.name.substring(0, 12) : ecu.name);
+                    var pillW = Math.min(180, 70 + label.length * 6);
+                    if (px + pillW > 1540) { px = 48; py += 24; }
+                    var pillBg = on ? withAlpha(accent, 0.25) : withAlpha(t.text, 0.04);
+                    var pillBorder = on ? accent : withAlpha(t.dim, 0.3);
+                    cv.roundRect(px, py, pillW, 20, 5, pillBg);
+                    if (on) cv.fillRect(px, py, 3, 20, accent);
+                    cv.text(label, px + 8, py + 15, 11, on ? t.text : t.dim, { font: on ? 'bold' : 'normal' });
+                    logEcuTapTargets.push({ addr: ecu.addr, x: px, y: py, w: pillW, h: 20 });
+                    px += pillW + 6;
+                }
+                var tableY = py + 30;
+            } else {
+                var tableY = 150;
+            }
+
+            // results table
             if (logDiffs.length === 0 && !logging) {
                 if (logStatus) {
-                    cv.text('No changes detected during the logging period.', 800, 320, 22, t.dim, { align: 'center' });
-                    cv.text('Try: start log, toggle a function (lights, HVAC, etc.), stop log.', 800, 352, 18, withAlpha(t.dim, 0.6), { align: 'center' });
+                    cv.text('No changes detected.', 800, Math.max(tableY + 60, 320), 22, t.dim, { align: 'center' });
+                    cv.text('Start log, toggle a function (lights, HVAC, etc.), stop log.', 800, Math.max(tableY + 90, 352), 16, withAlpha(t.dim, 0.6), { align: 'center' });
                 }
                 return;
             }
@@ -584,30 +665,30 @@ mgu.run({
             var list = logging ? link.getLog().filter(function (e) { return e.type === 'change'; }) : logDiffs;
             if (list.length === 0) return;
 
-            var ty = 196;
-            cv.text('TIME', 48, ty, 13, t.dim, { font: 'bold', spacing: 1 });
-            cv.text('ECU', 160, ty, 13, t.dim, { font: 'bold', spacing: 1 });
-            cv.text('DID', 310, ty, 13, t.dim, { font: 'bold', spacing: 1 });
-            cv.text('BEFORE', 420, ty, 13, t.dim, { font: 'bold', spacing: 1 });
-            cv.text('AFTER', 920, ty, 13, t.dim, { font: 'bold', spacing: 1 });
+            cv.text('TIME', 48, tableY + 14, 12, t.dim, { font: 'bold', spacing: 1 });
+            cv.text('ECU', 160, tableY + 14, 12, t.dim, { font: 'bold', spacing: 1 });
+            cv.text('DID', 310, tableY + 14, 12, t.dim, { font: 'bold', spacing: 1 });
+            cv.text('BEFORE', 420, tableY + 14, 12, t.dim, { font: 'bold', spacing: 1 });
+            cv.text('AFTER', 920, tableY + 14, 12, t.dim, { font: 'bold', spacing: 1 });
+            tableY += 20;
 
-            var maxRows = Math.floor((H - 220) / 30);
+            var maxRows = Math.floor((H - tableY - 56) / 28);
             var shown = list.slice(-maxRows);
 
-            for (var i = 0; i < shown.length; i++) {
-                var entry = shown[i];
-                var y = 206 + i * 30;
-                cv.roundRect(40, y, 1520, 26, 4, withAlpha(t.warn, 0.08));
+            for (var j = 0; j < shown.length; j++) {
+                var entry = shown[j];
+                var y = tableY + j * 28;
+                cv.roundRect(40, y, 1520, 24, 4, withAlpha(t.warn, 0.08));
                 var timeStr = '+' + ((entry.ts - logStartTime) / 1000).toFixed(1) + 's';
                 var ecuName = KNOWN_ECUS[entry.addr] || '0x' + hx(entry.addr);
-                cv.text(timeStr, 58, y + 19, 14, t.text);
-                cv.text(fitText(cv, '0x' + hx(entry.addr) + ' ' + ecuName, 14, 140), 160, y + 19, 14, t.text);
-                cv.text(entry.did, 310, y + 19, 14, accent, { font: 'bold' });
-                cv.text(fitText(cv, entry.before || '--', 12, 480), 420, y + 19, 12, t.dim);
-                cv.text(fitText(cv, entry.after || '--', 12, 480), 920, y + 19, 12, '#2fd27a');
+                cv.text(timeStr, 58, y + 17, 13, t.text);
+                cv.text(fitText(cv, '0x' + hx(entry.addr) + ' ' + ecuName, 13, 140), 160, y + 17, 13, t.text);
+                cv.text(entry.did, 310, y + 17, 13, accent, { font: 'bold' });
+                cv.text(fitText(cv, entry.before || '--', 12, 480), 420, y + 17, 12, t.dim);
+                cv.text(fitText(cv, entry.after || '--', 12, 480), 920, y + 17, 12, '#2fd27a');
             }
             if (list.length > maxRows) {
-                cv.text('+' + (list.length - maxRows) + ' earlier', 1552, H - 20, 14, t.dim, { align: 'right' });
+                cv.text('+' + (list.length - maxRows) + ' earlier', 1552, H - 56, 13, t.dim, { align: 'right' });
             }
         }
 
@@ -682,10 +763,40 @@ mgu.run({
                     }
                 }
             } else if (page === 4) {
-                if (x >= 48 && x < 248 && y >= 140 && y < 180) {
-                    if (logging) stopLogging();
-                    else startLogging();
-                    return;
+                // start/stop button
+                if (logBtnTarget) {
+                    var lb = logBtnTarget;
+                    if (x >= lb.x && x < lb.x + lb.w && y >= lb.y && y < lb.y + lb.h) {
+                        if (logging) stopLogging();
+                        else startLogging();
+                        return;
+                    }
+                }
+                // all button
+                if (logAllBtnTarget && !logging) {
+                    var la = logAllBtnTarget;
+                    if (x >= la.x && x < la.x + la.w && y >= la.y && y < la.y + la.h) {
+                        for (var ai = 0; ai < ecus.length; ai++) logSelected[ecus[ai].addr] = true;
+                        changed(); return;
+                    }
+                }
+                // none button
+                if (logNoneBtnTarget && !logging) {
+                    var ln = logNoneBtnTarget;
+                    if (x >= ln.x && x < ln.x + ln.w && y >= ln.y && y < ln.y + ln.h) {
+                        for (var ni = 0; ni < ecus.length; ni++) logSelected[ecus[ni].addr] = false;
+                        changed(); return;
+                    }
+                }
+                // ECU pills
+                if (!logging) {
+                    for (var li = 0; li < logEcuTapTargets.length; li++) {
+                        var lt = logEcuTapTargets[li];
+                        if (x >= lt.x && x < lt.x + lt.w && y >= lt.y && y < lt.y + lt.h) {
+                            logSelected[lt.addr] = !logSelected[lt.addr];
+                            changed(); return;
+                        }
+                    }
                 }
             }
         });

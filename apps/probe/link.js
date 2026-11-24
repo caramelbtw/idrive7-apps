@@ -550,7 +550,9 @@ class ProbeLink {
     get logging() { return this._logging; }
 
     /**
-     * Start logging: snapshot current status DIDs from all given ECU addresses.
+     * Start logging: snapshot current status DIDs from selected ECU addresses.
+     * Skips the rest of a DID range after 3 consecutive misses (e.g. if 1000-1002
+     * all fail, skip 1003-100F) to speed up the initial snapshot.
      */
     async startLog(ecus) {
         this._logging = true;
@@ -560,14 +562,22 @@ class ProbeLink {
         for (var i = 0; i < ecus.length; i++) {
             var addr = ecus[i];
             this.wake(addr);
+            var misses = 0;
+            var lastPrefix = '';
             for (var j = 0; j < LOG_DIDS.length; j++) {
                 var did = LOG_DIDS[j];
+                var prefix = did.substring(0, 2);
+                if (prefix !== lastPrefix) { misses = 0; lastPrefix = prefix; }
+                if (misses >= 3) continue;
                 var bytes = await this.readDid(addr, did);
                 if (bytes) {
+                    misses = 0;
                     var key = hx(addr) + ':' + did;
                     var hexStr = bytes.map(function (b) { return hx(b); }).join(' ');
                     this._snapshot[key] = hexStr;
                     this._logEntries.push({ ts: ts, addr: addr, did: did, type: 'snapshot', hex: hexStr });
+                } else {
+                    misses++;
                 }
             }
         }
