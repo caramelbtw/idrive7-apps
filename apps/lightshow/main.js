@@ -48,6 +48,7 @@ mgu.run({
         // strobe state
         var selectedPattern = 0;
         var strobeSpeed = 1.0;     // 1.0 = normal, <1 = faster, >1 = slower
+        var diagLine = 'tap PLAY to test BDC';
         var sequencer = new S.Sequencer(link(), log);
         var activeOnIds = [];
         sequencer.onStep = function (step, onIds) {
@@ -105,7 +106,7 @@ mgu.run({
                 statusMsg = 'No ECU reachable'; statusAt = Date.now();
             }
             if (bdcOk && !flmOk) {
-                statusMsg = 'FLM not routable via TASU'; statusAt = Date.now();
+                log.info('BDC ok, FLM not routable via TASU');
             }
             lastRead = Date.now();
             changed();
@@ -150,32 +151,60 @@ mgu.run({
         }
 
         /* ---------- strobe controls ---------- */
+        var hex = function(r) { return r ? Array.from(r).map(function(b){return b.toString(16).toUpperCase().padStart(2,'0')}).join(' ') : 'null'; };
+
         async function startStrobe() {
-            var pat = S.PATTERNS[selectedPattern];
-            if (!pat || !bdcOk) return;
-            var L = link();
-            sequencer.link = L;
-            status('Entering extended session...');
-            var sess = await L.ask(0x40, 0x10, [0x03]);
-            if (!sess || sess[0] === 0x7F) {
-                var nrc = sess ? sess[2] : 0;
-                status('BDC session refused (NRC ' + nrc.toString(16) + ')');
-                log.warn('BDC 10 03 refused: ' + (sess ? Array.from(sess).map(function(b){return b.toString(16)}).join(' ') : 'no reply'));
-                return;
+            try {
+                var pat = S.PATTERNS[selectedPattern];
+                if (!pat) { diagLine = 'no pattern'; changed(); return; }
+                diagLine = 'init...'; changed();
+                var linked = await ensureLink();
+                var L = link();
+                if (!linked) { diagLine = 'TASU not ready'; changed(); return; }
+
+                // read a known DID first to verify BDC comms
+                diagLine = '22 F150...'; changed();
+                var id = await L.ask(0x40, 0x22, [0xF1, 0x50]);
+                diagLine = '22: ' + hex(id); changed();
+                if (!id) { diagLine = 'BDC no reply to 22'; changed(); return; }
+
+                diagLine = '10 03...'; changed();
+                var sess = await L.ask(0x40, 0x10, [0x03]);
+                diagLine = '10: ' + hex(sess); changed();
+                if (!sess || sess[0] === 0x7F) { diagLine = '10 fail: ' + hex(sess); changed(); return; }
+
+                diagLine = '2F 6101 03 01...'; changed();
+                var test = await L.ask(0x40, 0x2F, [0x61, 0x01, 0x03, 0x01]);
+                diagLine = '2F: ' + hex(test); changed();
+
+                if (!test) {
+                    diagLine = '2F: no reply (TASU may not route 0x2F)';
+                    changed();
+                    await L.ask(0x40, 0x10, [0x01]).catch(function(){});
+                    return;
+                }
+                if (test[0] === 0x7F) {
+                    var nrcNames = {0x12:'subFunction',0x13:'msgLen',0x14:'respLen',0x22:'conditions',0x31:'outOfRange',0x33:'secAccess',0x72:'gpf'};
+                    var n = test[2]; var nm = nrcNames[n] || '';
+                    diagLine = '2F NRC ' + n.toString(16) + (nm ? ' (' + nm + ')' : '') + ' ' + hex(test);
+                    changed();
+                    await L.ask(0x40, 0x10, [0x01]).catch(function(){});
+                    return;
+                }
+
+                // IOControl accepted — hold DRL L on 2s so user sees it
+                diagLine = '2F OK! DRL L on 2s...'; changed();
+                await new Promise(function(r){ setTimeout(r, 2000); });
+                await L.ask(0x40, 0x2F, [0x61, 0x01, 0x00]);
+
+                diagLine = 'sequencer go'; changed();
+                sequencer.link = L;
+                await sequencer.start(pat, strobeSpeed);
+                diagLine = 'running'; changed();
+            } catch (e) {
+                diagLine = 'ERR: ' + String(e).slice(0, 60); changed();
+                log.warn('startStrobe: ' + e);
             }
-            // verify IOControl works with one test command before starting sequencer
-            var test = await L.ask(0x40, 0x2F, [0x61, 0x01, 0x03, 0x01]);
-            if (!test || test[0] === 0x7F) {
-                var nrc2 = test ? test[2] : 0;
-                status('IOControl refused (NRC ' + nrc2.toString(16) + ')');
-                log.warn('BDC 2F test refused: ' + (test ? Array.from(test).map(function(b){return b.toString(16)}).join(' ') : 'no reply'));
-                await L.ask(0x40, 0x10, [0x01]).catch(function(){});
-                return;
-            }
-            // restore test light before sequencer takes over
-            await L.ask(0x40, 0x2F, [0x61, 0x01, 0x00]);
-            await sequencer.start(pat, strobeSpeed);
-            changed();
         }
 
         async function stopStrobe() {
@@ -197,8 +226,8 @@ mgu.run({
                 conn = phase === 'reading' ? 'READING...' : 'CONNECTING...';
                 connColor = t.dim;
             } else if (page === 0) {
-                conn = bdcOk ? 'BDC CONNECTED' : 'NO LINK';
-                connColor = bdcOk ? '#2fd27a' : t.crit;
+                conn = diagLine || (bdcOk ? 'BDC CONNECTED' : 'NO LINK');
+                connColor = diagLine ? '#FF9900' : bdcOk ? '#2fd27a' : t.crit;
             } else {
                 conn = flmOk ? 'FLM CONNECTED' : bdcOk ? 'FLM UNAVAILABLE' : 'NO LINK';
                 connColor = flmOk ? '#2fd27a' : t.crit;
@@ -236,8 +265,7 @@ mgu.run({
             var cx = 600, cy = 142;
 
             var btnW = 200, btnH = 44;
-            var canPlay = bdcOk && phase === 'ready';
-            var btnColor = sequencer.running ? t.crit : canPlay ? (t.accent2 || t.accent) : withAlpha(t.dim, 0.3);
+            var btnColor = sequencer.running ? t.crit : (t.accent2 || t.accent);
             cv.roundRect(cx, cy, btnW, btnH, 8, btnColor);
             var btnLabel = sequencer.running ? 'STOP' : 'PLAY';
             cv.text(btnLabel, cx + btnW / 2, cy + 30, 20, '#FFFFFF', { align: 'center', font: 'bold' });
@@ -266,6 +294,12 @@ mgu.run({
             cy += 72;
             cv.text('LIVE', cx, cy + 14, 13, t.dim, { font: 'bold', spacing: 1 });
             drawLightViz(cv, t, cx, cy + 24);
+
+            // persistent diagnostic line — below header, above patterns
+            if (diagLine) {
+                cv.roundRect(cx, 100, 500, 24, 4, 'rgba(255,153,0,0.15)');
+                cv.text(diagLine, cx + 250, 118, 14, '#FF9900', { align: 'center', font: 'bold' });
+            }
         }
 
         function drawLightViz(cv, t, ox, oy) {
@@ -423,7 +457,7 @@ mgu.run({
                     if (x >= ct.x && x < ct.x + ct.w && y >= ct.y && y < ct.y + ct.h) {
                         if (ct.id === 'play_stop') {
                             if (sequencer.running) stopStrobe();
-                            else startStrobe();
+                            else { diagLine = 'PLAY tapped...'; changed(); startStrobe(); }
                         } else if (ct.speedValue !== undefined) {
                             strobeSpeed = ct.speedValue;
                             if (sequencer.running) {

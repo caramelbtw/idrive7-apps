@@ -106,6 +106,21 @@ if (glyph === 'gauge') {
     c.convex([[96, 56], [74, 64], [78, 78], [94, 74]], A);
     c.convex([[70, 82], [64, 94], [76, 94]], '#000000');     // nose
     for (let i = 0; i < 4; i++) c.fillRect(52 + i * 11, 104, 3, 16, '#000000');   // teeth
+} else if (glyph === 'lightshow') {
+    // two BMW angel-eye headlights with a lightning bolt between them
+    // left headlight halo
+    c.arc(36, 74, 22, 28, 0, 360, W);
+    c.circle(36, 74, 9, W);
+    // left rays (short, upward fan)
+    for (let a = -70; a <= 70; a += 35) { const [x, y] = pt(36, 74, 38, a); c.line(36, 74, x, y, 3, W); }
+    // right headlight halo
+    c.arc(104, 74, 22, 28, 0, 360, A);
+    c.circle(104, 74, 9, A);
+    // right rays
+    for (let a = -70; a <= 70; a += 35) { const [x, y] = pt(104, 74, 38, a); c.line(104, 74, x, y, 3, A); }
+    // lightning bolt between headlights
+    c.convex([[76, 16], [60, 66], [72, 66]], B);
+    c.convex([[64, 124], [80, 74], [68, 74]], B);
 } else if (glyph === 'ambient') {
     // a door panel's light line in three colours, and the glow under it
     c.strokeRoundRect(14, 30, 112, 80, 16, 6, W);
