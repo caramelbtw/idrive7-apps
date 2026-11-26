@@ -24,25 +24,18 @@ var hx = function (n) { return Number.isInteger(n) ? n.toString(16).toUpperCase(
 mgu.run({
     async start(ctx) {
         const { ui, settings, log } = ctx;
-        const link = new ProbeLink(ctx.signals, log);
-        var linkReady = false;
+        var link = null;
         var linkPromise = null;
 
-        async function ensureLink() {
-            if (linkReady) return true;
-            if (!linkPromise) {
-                linkPromise = link.init().then(function () {
-                    linkReady = link.ready;
-                    log.info('TASU init done: ready=' + link.ready + ' available=' + link.available + ' failed=' + link.failed);
-                }).catch(function (e) {
-                    log.warn('TASU init failed: ' + e);
-                    linkPromise = null;
-                });
-            }
-            await linkPromise;
-            return linkReady;
-        }
-        ensureLink();
+        // matches the DTC scanner's getDiag pattern exactly: one init, cached
+        var getLink = function () {
+            return linkPromise || (linkPromise = new ProbeLink(ctx.signals, log).init().then(function (l) {
+                link = l;
+                log.info('TASU init done: ready=' + l.ready + ' available=' + l.available);
+                return l;
+            }));
+        };
+        getLink();
 
         /* ---------- state ---------- */
         var page = 0, version = 0;
@@ -84,10 +77,16 @@ mgu.run({
         async function doScan() {
             if (phase === 'scanning') return;
             phase = 'scanning'; changed();
-            var linked = await ensureLink();
-            if (!linked) {
+            try { await getLink(); } catch (e) {
                 phase = 'error';
-                statusMsg = link.failed ? 'TASU: ' + link.failed : 'TASU not ready';
+                statusMsg = 'TASU: ' + e.message;
+                statusAt = Date.now();
+                changed();
+                return;
+            }
+            if (!link || !link.ready) {
+                phase = 'error';
+                statusMsg = link && link.failed ? 'TASU: ' + link.failed : 'TASU not ready';
                 statusAt = Date.now();
                 changed();
                 return;
@@ -729,7 +728,7 @@ mgu.run({
                     if (x >= rt.x && x < rt.x + rt.w && y >= rt.y && y < rt.y + rt.h) {
                         phase = 'idle'; ecus = []; selectedIdx = -1; ecuDetail = [];
                         ecuServices = []; servicesLoaded = false; didResults = [];
-                        faults = null; linkReady = false; linkPromise = null; link.wake();
+                        faults = null;
                         doScan(); changed(); return;
                     }
                 }
@@ -806,7 +805,7 @@ mgu.run({
             if (page === 0) {
                 phase = 'idle'; ecus = []; selectedIdx = -1; ecuDetail = [];
                 ecuServices = []; servicesLoaded = false; didResults = [];
-                faults = null; linkReady = false; linkPromise = null; link.wake();
+                faults = null;
                 doScan();
             } else if (page === 1) {
                 ecuDetail = []; ecuServices = []; servicesLoaded = false;

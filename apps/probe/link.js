@@ -2,22 +2,13 @@
 /**
  * link.js - diagnostic link for Probe.
  *
- * Unlike the other apps' links this one is intentionally broad: it needs to reach
- * every ECU on the bus with read-only services so the user can discover what is
- * connected and watch what changes.
+ * Uses Diag directly — the same pattern as the working DTC scanner app.
+ * No queue, no pacing layer, no miss tracking. The TASU transport in
+ * diag.js already handles retries and backoff for busy verdicts.
  *
- * Scan strategy: a single functional broadcast (0xDF TesterPresent) discovers every
- * online ECU in one transport request (~5 s). Physical requests then identify only
- * the ECUs that actually answered. This avoids hammering the TASU with 128 individual
- * requests that trigger APP_REQUEST_TEMPORARILY_NOT_ACCEPTED.
- *
- * Allowed services (read-only - no write, no actuation, no clear):
- *   0x10  DiagnosticSessionControl (01 default, 03 extended) - needed to read some DIDs
- *   0x22  ReadDataByIdentifier     - any DID (identification, status, coding reads)
- *   0x19  ReadDTCInformation       - sub-function 02 only (read, never clear)
- *   0x3E  TesterPresent            - keep-alive / probe if ECU is there
- *
- * Target: any single ECU address 0x00-0x7F, or functional 0xDF.
+ * Scan: functional 0x19 02 FF to 0xDF (all ECUs answer), then physical
+ * 0x22 F1 50 to each responder for SGBD identification — identical to
+ * the DTC scanner's proven approach.
  */
 const { Diag, replyTo } = require('./kit/diag');
 
@@ -166,120 +157,58 @@ const LOG_DIDS = Object.freeze([
     'F190', 'F40C', 'F411', 'F441', 'F446',
 ]);
 
-const LINKS = new WeakMap();
-var byte = function (b) { return Number.isInteger(b) && b >= 0 && b <= 0xFF; };
 var hx = function (n) { return Number.isInteger(n) ? n.toString(16).toUpperCase().padStart(2, '0') : String(n); };
 
-function check(target, sid, data) {
-    if (!Array.isArray(data) || !data.every(byte)) throw new Error('bad request bytes');
-    if (target !== 0xDF && (!Number.isInteger(target) || target < 0x00 || target > 0x7F))
-        throw new Error('target ' + hx(target) + ' out of range');
-
-    if (sid === 0x3E) {
-        if (data.length > 1) throw new Error('3E too long');
-        return;
-    }
-    if (sid === 0x10) {
-        if (data.length !== 1 || (data[0] !== 0x01 && data[0] !== 0x03))
-            throw new Error('10 ' + data.map(hx).join(' ') + ' not allowed');
-        return;
-    }
-    if (sid === 0x22) {
-        if (data.length < 2) throw new Error('22 needs at least 2 bytes');
-        return; // any DID is allowed for reading
-    }
-    if (sid === 0x19) {
-        if (data.length < 1 || data[0] !== 0x02) throw new Error('19 only sub-function 02 allowed');
-        return;
-    }
-    throw new Error('service ' + hx(sid) + ' is not allowed (read-only)');
+/**
+ * Accept filter for physical(): matches this service's positive reply
+ * (echoes the DID/sub-function) or its negative reply.
+ */
+function accept(sid, data) {
+    return function (u) {
+        if (u[0] === 0x7F && u[1] === sid) return true;
+        if (u[0] !== sid + 0x40) return false;
+        if (sid === 0x22 && data.length >= 2) return u[1] === data[0] && u[2] === data[1];
+        if (sid === 0x10 && data.length >= 1) return u[1] === data[0];
+        if (sid === 0x19 && data.length >= 1) return u[1] === data[0];
+        return true;
+    };
 }
 
-var sleep = function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
-
+/**
+ * ProbeLink — thin wrapper around Diag.
+ * Calls diag.functional() and diag.physical() directly, the same way
+ * the working DTC scanner does. No queue, no pacing, no miss tracking.
+ */
 class ProbeLink {
-    constructor(signals, log, opts) {
-        var diag = new Diag(signals, log);
-        diag.quiet = true;
-        diag.busyMs = 1000;
-        diag.busyLog = true;
-        LINKS.set(this, diag);
+    constructor(signals, log) {
+        this._diag = new Diag(signals, log);
+        this._diag.quiet = true;
         this.log = log;
-        this.gapMs = (opts && opts.gapMs) || 100;
-        this.timeoutMs = (opts && opts.timeoutMs) || 4000;
-        this.scanTimeoutMs = (opts && opts.scanTimeoutMs) || 2000;
-        this.silentAfter = (opts && opts.silentAfter) || 3;
-        this.misses = {};
-        this.stats = { sent: 0, replies: 0, missed: 0, blocked: 0 };
-        this.chain = Promise.resolve();
-        this.next = 0;
 
         // logging state
         this._logging = false;
         this._logEntries = [];
-        this._snapshot = {};   // 'addr:did' -> hex string of bytes at log start
+        this._snapshot = {};
     }
 
     async init() {
-        var diag = LINKS.get(this);
-        await diag.init();
-        if (!diag.available) {
-            var self = this;
-            await new Promise(function (resolve) {
-                var timer = setTimeout(function () { diag.removeListener('available', onAvail); resolve(); }, 5000);
-                function onAvail(a) { if (a) { clearTimeout(timer); diag.removeListener('available', onAvail); resolve(); } }
-                diag.on('available', onAvail);
-            });
-            self.log.info('TASU available after wait: ' + diag.available);
-        }
+        await this._diag.init();
         return this;
     }
-    get available() { return LINKS.get(this).available; }
-    get ready() { return !!LINKS.get(this).p; }
-    get failed() { return LINKS.get(this).error; }
-    silent(target) { return (this.misses[target] || 0) >= this.silentAfter; }
-    wake(target) { if (target === undefined) this.misses = {}; else delete this.misses[target]; }
+    get available() { return this._diag.available; }
+    get ready() { return !!this._diag.p; }
+    get failed() { return this._diag.error; }
 
     /**
-     * Send one allowed read-only request and return the UDS reply bytes, or null.
-     * Optional timeoutMs overrides the default for this single request.
+     * Physical request to one ECU. Returns the UDS reply bytes, or null.
      */
-    ask(target, sid, data, timeoutMs) {
-        var d = Array.isArray(data) ? data.slice() : [];
-        try { check(target, sid, d); } catch (e) {
-            this.stats.blocked++;
-            this.log.error('blocked: ' + e.message);
-            return Promise.reject(e);
+    async physical(target, sid, data, timeoutMs) {
+        try {
+            return await this._diag.physical(target, sid, data, timeoutMs || 3000, accept(sid, data));
+        } catch (e) {
+            this.log.warn('physical 0x' + hx(target) + ' sid ' + hx(sid) + ': ' + e.message);
+            return null;
         }
-        if (target !== 0xDF && this.silent(target)) return Promise.resolve(null);
-        var self = this;
-        var ms = timeoutMs || self.timeoutMs;
-        var run = async function () {
-            var wait = Math.max(0, self.next - Date.now());
-            if (wait) await sleep(wait);
-            try {
-                self.stats.sent++;
-                var uds = await LINKS.get(self).physical(
-                    target, sid, d,
-                    ms,
-                    replyTo(sid, d)
-                );
-                if (!uds) { self.stats.missed++; self.misses[target] = (self.misses[target] || 0) + 1; return null; }
-                self.misses[target] = 0;
-                self.stats.replies++;
-                if (uds[0] === 0x7F && uds[2] === 0x21) self.next = Math.max(self.next, Date.now() + 2000);
-                return uds;
-            } catch (e) {
-                if (/transport refused/i.test(e.message)) {
-                    self.log.warn('transport refused for 0x' + hx(target) + ' sid ' + hx(sid) + ', backing off 3s');
-                    self.next = Math.max(self.next, Date.now() + 3000);
-                    self.stats.missed++;
-                    return null;
-                }
-                throw e;
-            } finally { self.next = Math.max(self.next, Date.now() + self.gapMs); }
-        };
-        return this.queue(run);
     }
 
     /**
@@ -287,115 +216,59 @@ class ProbeLink {
      */
     async readDid(ecu, did) {
         var d1 = parseInt(did.slice(0, 2), 16), d2 = parseInt(did.slice(2, 4), 16);
-        var r = await this.ask(ecu, 0x22, [d1, d2]);
+        var r = await this.physical(ecu, 0x22, [d1, d2]);
         if (!r || r[0] !== 0x62 || r[1] !== d1 || r[2] !== d2) return null;
         return Array.prototype.slice.call(r, 3);
     }
 
     /**
-     * Send tester present to an ECU. Returns true if it answered.
-     * Uses the faster scanTimeoutMs for quick sweeps.
+     * Discover all online ECUs using functional 0x19 02 FF — the same approach
+     * the working DTC scanner uses. Returns Map(ecuAddress -> udsReply).
      */
-    async ping(ecu) {
-        var r = await this.ask(ecu, 0x3E, [0x00], this.scanTimeoutMs);
-        return r !== null && r[0] !== 0x7F;
-    }
-
-    /**
-     * Identify an ECU: read F150 and return the SGBD index string, or ''.
-     */
-    async identify(ecu) {
-        var r = await this.ask(ecu, 0x22, [0xF1, 0x50]);
-        if (!r || r[0] !== 0x62 || r.length < 6) return '';
-        return ((r[3] << 16) | (r[4] << 8) | r[5]).toString(16).toUpperCase().padStart(6, '0');
-    }
-
-    /**
-     * Discover all online ECUs using a single functional broadcast (0xDF).
-     * Uses ReadDTCInformation (0x19 02 FF) — the same service the working DTC
-     * scanner app uses, proven reliable on BMW TASU. Some gateways rate-limit
-     * or reject functional TesterPresent (0x3E), but 0x19 always gets through.
-     *
-     * Retries up to 3 times with a 3-second pause between attempts.
-     * Returns Map(ecuAddress -> udsReply) of every ECU that responded.
-     */
-    async broadcast() {
-        var diag = LINKS.get(this);
-        var self = this;
-        for (var attempt = 0; attempt < 3; attempt++) {
-            if (attempt > 0) {
-                self.log.info('broadcast: retry ' + attempt + ' after 3s');
-                await sleep(3000);
-            }
-            self.log.info('broadcast: functional 19 02 FF to 0xDF (all ECUs), attempt ' + (attempt + 1));
-            try {
-                var replies = await diag.functional(0x19, [0x02, 0xFF], {
-                    idleMs: 5000,
-                    maxMs: 15000,
-                    onReply: function (ecu, count) {
-                        self.log.info('broadcast: ECU 0x' + hx(ecu) + ' answered (#' + count + ')');
-                    },
-                });
-                self.log.info('broadcast: ' + replies.size + ' ECUs responded');
-                if (replies.size > 0) return replies;
-            } catch (e) {
-                self.log.warn('broadcast attempt ' + (attempt + 1) + ' failed: ' + e.message);
-                if (!/transport refused/i.test(e.message)) throw e;
-            }
+    async broadcast(onReply) {
+        this.log.info('broadcast: functional 19 02 FF to 0xDF (all ECUs)');
+        try {
+            var replies = await this._diag.functional(0x19, [0x02, 0xFF], {
+                onReply: onReply || function () {},
+            });
+            this.log.info('broadcast: ' + replies.size + ' ECUs responded');
+            return replies;
+        } catch (e) {
+            this.log.warn('broadcast failed: ' + e.message);
+            return new Map();
         }
-        self.log.warn('broadcast: all attempts exhausted, returning empty');
-        return new Map();
     }
 
     /**
-     * Scan for all online ECUs. Two-phase approach:
-     *   Phase 1: functional broadcast (one TASU request) discovers all responding addresses
-     *   Phase 2: physical requests identify each responder (read F150 SGBD index)
+     * Scan for all online ECUs.
+     *   Phase 1: functional broadcast discovers responding addresses
+     *   Phase 2: physical 22 F1 50 identifies each responder
      *
      * Returns array of { addr, name, sgbd, online }.
-     * onProgress(phase, detail) callback for UI updates:
-     *   phase='broadcast': detail = { found }
-     *   phase='identify':  detail = { current, total, found }
      */
     async scan(onProgress) {
-        this.wake();
         var results = [];
 
-        // Phase 1: broadcast discovery
         if (onProgress) onProgress('broadcast', { found: 0 });
-        var replies = await this.broadcast();
+        var replies = await this.broadcast(function (ecu, count) {
+            if (onProgress) onProgress('broadcast', { found: count });
+        });
         var addrs = [];
         replies.forEach(function (uds, ecu) { addrs.push(ecu); });
         addrs.sort(function (a, b) { return a - b; });
-        if (onProgress) onProgress('broadcast', { found: addrs.length });
 
-        if (addrs.length === 0) {
-            this.log.warn('broadcast found no ECUs, falling back to known-address ping');
-            // fallback: try a small set of well-known addresses individually
-            var fallback = [0x02, 0x07, 0x10, 0x12, 0x18, 0x29, 0x40, 0x53, 0x58, 0x60, 0x78];
-            for (var fi = 0; fi < fallback.length; fi++) {
-                var fAddr = fallback[fi];
-                this.wake(fAddr);
-                if (onProgress) onProgress('identify', { current: fi + 1, total: fallback.length, found: results.length });
-                var fAlive = await this.ping(fAddr);
-                if (!fAlive) continue;
-                var fSgbd = await this.identify(fAddr);
-                results.push({
-                    addr: fAddr,
-                    name: KNOWN_ECUS[fAddr] || 'Unknown 0x' + hx(fAddr),
-                    sgbd: fSgbd,
-                    online: true,
-                });
-            }
-            return results;
-        }
-
-        // Phase 2: identify each responder — only the ECUs that actually answered
         this.log.info('identify: reading SGBD from ' + addrs.length + ' ECUs');
         for (var i = 0; i < addrs.length; i++) {
             var addr = addrs[i];
             if (onProgress) onProgress('identify', { current: i + 1, total: addrs.length, found: results.length });
-            var sgbd = await this.identify(addr);
+            var sgbd = '';
+            try {
+                var r = await this._diag.physical(addr, 0x22, [0xF1, 0x50], 3000,
+                    function (u) { return (u[0] === 0x62 && u[1] === 0xF1 && u[2] === 0x50) || (u[0] === 0x7F && u[1] === 0x22); });
+                if (r && r[0] === 0x62 && r.length >= 6) {
+                    sgbd = ((r[3] << 16) | (r[4] << 8) | r[5]).toString(16).toUpperCase().padStart(6, '0');
+                }
+            } catch (e) { this.log.warn('identify 0x' + hx(addr) + ': ' + e.message); }
             results.push({
                 addr: addr,
                 name: KNOWN_ECUS[addr] || 'Unknown 0x' + hx(addr),
@@ -412,8 +285,7 @@ class ProbeLink {
      */
     async readIdDids(ecu) {
         var out = [];
-        // enter extended session so more DIDs are accessible
-        await this.ask(ecu, 0x10, [0x03]).catch(function () {});
+        await this.physical(ecu, 0x10, [0x03], 3000);
         for (var i = 0; i < ID_DIDS.length; i++) {
             var d = ID_DIDS[i];
             var bytes = await this.readDid(ecu, d.did);
@@ -422,17 +294,12 @@ class ProbeLink {
             var ascii = bytes.map(function (b) { return b >= 0x20 && b < 0x7F ? String.fromCharCode(b) : '.'; }).join('');
             out.push({ did: d.did, name: d.name, hex: hexStr, ascii: ascii });
         }
-        // return to default session
-        this.ask(ecu, 0x10, [0x01]).catch(function () {});
+        this.physical(ecu, 0x10, [0x01], 3000);
         return out;
     }
 
-    /* ---------- service discovery ---------- */
-
     /**
-     * Probe which UDS services an ECU supports. Sends each service with minimal
-     * safe data — NRC 0x11 (serviceNotSupported) means no, any other reply means yes.
-     * Returns array of { sid, name, supported, nrc }.
+     * Probe which UDS services an ECU supports.
      */
     async discoverServices(ecu) {
         var services = [
@@ -454,10 +321,9 @@ class ProbeLink {
             { sid: 0x85, name: 'ControlDTCSetting', data: [0x01] },
         ];
         var out = [];
-        this.wake(ecu);
         for (var i = 0; i < services.length; i++) {
             var s = services[i];
-            var r = await this.askRaw(ecu, s.sid, s.data, this.scanTimeoutMs);
+            var r = await this.physical(ecu, s.sid, s.data, 2000);
             var supported = false, nrc = null;
             if (r) {
                 if (r[0] === 0x7F && r[1] === s.sid) {
@@ -472,18 +338,14 @@ class ProbeLink {
         return out;
     }
 
-    /* ---------- DID range scanner ---------- */
-
     /**
-     * Sweep a DID range on an ECU to find all readable DIDs.
-     * Returns array of { did (hex string), bytes (data length), hex (first bytes preview) }.
-     * onProgress(scanned, total, found) called during sweep.
+     * Sweep a DID range on an ECU.
+     * Returns array of { did (hex string), bytes (data length), hex (preview) }.
      */
     async scanDidRange(ecu, startDid, endDid, onProgress) {
         var out = [];
         var total = endDid - startDid + 1;
-        this.wake(ecu);
-        await this.ask(ecu, 0x10, [0x03]).catch(function () {});
+        await this.physical(ecu, 0x10, [0x03], 3000);
         for (var did = startDid; did <= endDid; did++) {
             var d1 = (did >> 8) & 0xFF, d2 = did & 0xFF;
             var didHex = hx(d1) + hx(d2);
@@ -494,19 +356,15 @@ class ProbeLink {
             if (bytes.length > 16) preview += ' ...';
             out.push({ did: didHex, bytes: bytes.length, hex: preview });
         }
-        this.ask(ecu, 0x10, [0x01]).catch(function () {});
+        this.physical(ecu, 0x10, [0x01], 3000);
         return out;
     }
 
-    /* ---------- fault reader ---------- */
-
     /**
-     * Read BMW fault memory (19 02) from an ECU.
-     * Returns array of { code (hex string), status (byte), statusBits }.
+     * Read fault memory (19 02 FF) from an ECU.
      */
     async readFaults(ecu) {
-        this.wake(ecu);
-        var r = await this.ask(ecu, 0x19, [0x02, 0xFF]);
+        var r = await this.physical(ecu, 0x19, [0x02, 0xFF]);
         if (!r || r[0] !== 0x59 || r[1] !== 0x02) return null;
         var out = [];
         var i = 3;
@@ -528,51 +386,13 @@ class ProbeLink {
         return out;
     }
 
-    /* ---------- raw ask (bypasses check for service discovery) ---------- */
-
-    /**
-     * Send any service to an ECU and return the raw UDS reply, or null.
-     * Used internally for service discovery only — still read-only in effect
-     * because discovery sends minimal/invalid data that ECUs reject without acting.
-     */
-    askRaw(target, sid, data, timeoutMs) {
-        if (!Number.isInteger(target) || target < 0x00 || target > 0x7F) return Promise.resolve(null);
-        var d = Array.isArray(data) ? data.slice() : [];
-        var self = this;
-        var ms = timeoutMs || self.timeoutMs;
-        var run = async function () {
-            var wait = Math.max(0, self.next - Date.now());
-            if (wait) await sleep(wait);
-            try {
-                self.stats.sent++;
-                var accept = function (u) {
-                    return (u[0] === sid + 0x40) || (u[0] === 0x7F && u[1] === sid);
-                };
-                var uds = await LINKS.get(self).physical(target, sid, d, ms, accept);
-                if (!uds) { self.stats.missed++; return null; }
-                self.stats.replies++;
-                return uds;
-            } catch (e) {
-                if (/transport refused/i.test(e.message)) {
-                    self.log.warn('askRaw transport refused for 0x' + hx(target) + ', backing off 3s');
-                    self.next = Math.max(self.next, Date.now() + 3000);
-                    self.stats.missed++;
-                    return null;
-                }
-                throw e;
-            } finally { self.next = Math.max(self.next, Date.now() + self.gapMs); }
-        };
-        return this.queue(run);
-    }
-
     /* ---------- logging ---------- */
 
     get logging() { return this._logging; }
 
     /**
      * Start logging: snapshot current status DIDs from selected ECU addresses.
-     * Skips the rest of a DID range after 3 consecutive misses (e.g. if 1000-1002
-     * all fail, skip 1003-100F) to speed up the initial snapshot.
+     * Skips the rest of a DID range after 3 consecutive misses.
      */
     async startLog(ecus) {
         this._logging = true;
@@ -581,7 +401,6 @@ class ProbeLink {
         var ts = Date.now();
         for (var i = 0; i < ecus.length; i++) {
             var addr = ecus[i];
-            this.wake(addr);
             var misses = 0;
             var lastPrefix = '';
             for (var j = 0; j < LOG_DIDS.length; j++) {
@@ -603,15 +422,11 @@ class ProbeLink {
         }
     }
 
-    /**
-     * Poll all ECUs during logging: read the same DIDs and record any changes.
-     */
     async pollLog(ecus) {
         if (!this._logging) return;
         var ts = Date.now();
         for (var i = 0; i < ecus.length; i++) {
             var addr = ecus[i];
-            this.wake(addr);
             for (var j = 0; j < LOG_DIDS.length; j++) {
                 var did = LOG_DIDS[j];
                 var key = hx(addr) + ':' + did;
@@ -630,25 +445,13 @@ class ProbeLink {
         }
     }
 
-    /**
-     * Stop logging, return the diff: entries that changed between start and now.
-     */
     stopLog() {
         this._logging = false;
         return this._logEntries.filter(function (e) { return e.type === 'change'; });
     }
 
-    /**
-     * Return all log entries (snapshots + changes).
-     */
     getLog() {
         return this._logEntries.slice();
-    }
-
-    queue(run) {
-        var p = this.chain.then(run, run);
-        this.chain = p.catch(function () {});
-        return p;
     }
 }
 
@@ -675,4 +478,4 @@ const NRC_NAMES = Object.freeze({
     0x7E: 'subFunctionNotSupportedInActiveSession', 0x7F: 'serviceNotSupportedInActiveSession',
 });
 
-module.exports = { ProbeLink, check, KNOWN_ECUS, ID_DIDS, LOG_DIDS, DID_RANGES, NRC_NAMES };
+module.exports = { ProbeLink, KNOWN_ECUS, ID_DIDS, LOG_DIDS, DID_RANGES, NRC_NAMES };
